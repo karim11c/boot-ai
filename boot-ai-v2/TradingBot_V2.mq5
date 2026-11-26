@@ -50,6 +50,8 @@ input double PartialExitPercent1 = 50.0;
 input double PartialExitAtR2 = 3.0;
 input double PartialExitPercent2 = 25.0;
 input bool TrailRunnerAfterSecondPartial = true;
+input bool TightenStopAfterStrongEntryBar = true;
+input int StrongEntryBarStopOffsetTicks = 1;
 input bool MoveStopToBreakevenAtOneR = false;
 input bool EnableSwingTrailingStop = false;
 input int SwingTrailLookbackBars = 20;
@@ -60,6 +62,8 @@ CTrade trade;
 datetime g_lastEntryBar = 0;
 datetime g_partialExitRetryAfter = 0;
 ulong g_partialExitRetryTicket = 0;
+datetime g_entryStopRetryAfter = 0;
+ulong g_entryStopRetryTicket = 0;
 string g_lastSignalKey = "";
 
 struct SContext
@@ -1322,6 +1326,11 @@ void ManageOpenPosition(const MqlRates &rates[])
       g_partialExitRetryTicket = ticket;
       g_partialExitRetryAfter = 0;
    }
+   if(ticket != g_entryStopRetryTicket)
+   {
+      g_entryStopRetryTicket = ticket;
+      g_entryStopRetryAfter = 0;
+   }
    long type = PositionGetInteger(POSITION_TYPE);
    double open = PositionGetDouble(POSITION_PRICE_OPEN);
    double stop = PositionGetDouble(POSITION_SL);
@@ -1364,6 +1373,55 @@ void ManageOpenPosition(const MqlRates &rates[])
    double mark = (type == POSITION_TYPE_BUY ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
                                              : SymbolInfoDouble(_Symbol, SYMBOL_ASK));
    double favorable = (type == POSITION_TYPE_BUY ? mark-open : open-mark);
+   string entryStopKey = "BAI2_ENTRY_BAR_STOP_" + (string)ticket;
+   if(TightenStopAfterStrongEntryBar && heldBars == 1 && ArraySize(rates) > 0 &&
+      rates[0].time == iTime(_Symbol, EntryTF, 1) &&
+      !GlobalVariableCheck(entryStopKey) && TimeCurrent() >= g_entryStopRetryAfter)
+   {
+      int positionDirection = (type == POSITION_TYPE_BUY ? 1 : -1);
+      bool strongEntryBar = (BarDirection(rates[0]) == positionDirection &&
+                             BodyShare(rates[0]) >= StrongBodyShare &&
+                             (positionDirection > 0 ?
+                              rates[0].close >= rates[0].high - 0.20 * BarRange(rates[0]) :
+                              rates[0].close <= rates[0].low + 0.20 * BarRange(rates[0])));
+      if(!strongEntryBar)
+      {
+         GlobalVariableSet(entryStopKey, 1.0);
+         Print("ENTRY BAR STOP: original protective stop retained; entry bar was not a strong directional bar.");
+      }
+      else
+      {
+         double offset = TickSize() * StrongEntryBarStopOffsetTicks;
+         double candidate = NormalizePrice(positionDirection > 0 ?
+                             rates[0].low - offset : rates[0].high + offset);
+         bool tighter = (positionDirection > 0 ?
+                         (stop == 0.0 || candidate > stop) :
+                         (stop == 0.0 || candidate < stop));
+         double minStopDistance = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+         bool validDistance = (positionDirection > 0 ?
+                               candidate < mark - minStopDistance :
+                               candidate > mark + minStopDistance);
+         if(!tighter)
+         {
+            GlobalVariableSet(entryStopKey, 1.0);
+            Print("ENTRY BAR STOP: original stop retained; candidate would not tighten risk.");
+         }
+         else if(!validDistance)
+         {
+            GlobalVariableSet(entryStopKey, 1.0);
+            Print("ENTRY BAR STOP: original stop retained; broker stop-distance would be violated.");
+         }
+         else if(ModifyManagedPosition(ticket, candidate, target))
+         {
+            stop = candidate;
+            GlobalVariableSet(entryStopKey, 1.0);
+            Print("ENTRY BAR STOP TIGHTENED: strong entry bar; offset ticks=",
+                  StrongEntryBarStopOffsetTicks, ".");
+         }
+         else
+            g_entryStopRetryAfter = TimeCurrent() + 5;
+      }
+   }
    if(partialMode && TimeCurrent() >= g_partialExitRetryAfter &&
       favorable >= initialRisk * PartialExitAtR1 &&
       !GlobalVariableCheck(partialKey1))
@@ -1535,6 +1593,7 @@ int OnInit()
       SwingTrailLookbackBars < 2 || SwingTrailLookbackBars > BarsToRead - 2 ||
       RangeEdgePercent <= 0.0 || RangeEdgePercent >= 50.0 ||
       StrongBodyShare < 0.0 || StrongBodyShare > 1.0 ||
+      StrongEntryBarStopOffsetTicks < 1 || StrongEntryBarStopOffsetTicks > 2 ||
       SessionStartHour < 0 || SessionStartHour > 23 || SessionEndHour < 0 || SessionEndHour > 23)
    {
       Print("INPUT ERROR: Risk, probability, target, or evidence threshold is invalid.");
