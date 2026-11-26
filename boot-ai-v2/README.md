@@ -14,6 +14,7 @@ The V2 expert advisor is designed to:
 - Calculate a proposed stop, target, size, and expected value before an order is considered.
 - Optionally scale out only in a detected aligned strong trend: half near 2R, another quarter near 3R, then trail the remaining quarter; scale-in remains blocked.
 - After a strong directional entry bar closes, optionally tighten the protective stop beyond its extreme; weak or Doji bars keep the original stop.
+- Close an open managed position when a fully qualified opposite-direction setup appears; retry a rejected close and wait for another bar before considering a new entry.
 - Default to analysis-only mode. Order execution is behind explicit inputs and demo-account checks.
 - Cancel an unfilled managed pending entry if its attached invalidation level is reached, and cancel managed pending entries when execution is turned off.
 
