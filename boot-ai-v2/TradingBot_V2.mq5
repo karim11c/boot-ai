@@ -4,7 +4,156 @@
 
 #include <Trade/Trade.mqh>
 
-// All numeric thres  double stop;
+// All numeric thresholds are engineering heuristics, not rules stated by the author.
+// Execution is disabled by default. Keep it disabled until the rule map and tests pass.
+input ENUM_TIMEFRAMES EntryTF = PERIOD_M15;
+input ENUM_TIMEFRAMES TrendTF = PERIOD_H1;
+input int BarsToRead = 100;
+input int RangeLookback = 20;
+input int TrendBarsPerLeg = 5;
+input double SteepTrendDisplacementATR = 2.0;
+input int MovingAveragePeriod = 20;
+input double RangeOverlapThreshold = 0.55;
+input double StrongBodyShare = 0.55;
+input double SmallBarRangeATR = 0.50;
+input double RangeEdgePercent = 25.0;
+input int MinReasonGroups = 2;
+input bool AllowTightRangeSignals = false;
+
+enum ENUM_BOOTAI_STYLE
+{
+   STYLE_SCALP = 0,
+   STYLE_INTRADAY_SWING = 1,
+   STYLE_SWING = 2
+};
+
+input ENUM_BOOTAI_STYLE TradeStyle = STYLE_INTRADAY_SWING;
+input int MaxBarsForScalp = 1;
+input int MaxBarsForIntraday = 40;
+input int MaxBarsForSwing = 160;
+input double EstimatedWinProbability = 0.50;
+input double MinimumExpectedValuePoints = 0.0;
+input double RiskPercent = 0.25;
+input double TargetRR = 2.0;
+input double CommissionPerLotRoundTurn = 0.0;
+input int SlippagePointsEstimate = 2;
+input double LimitEntryRiskMultiplier = 0.50;
+input bool UseSessionFilter = false;
+input int SessionStartHour = 7; // Broker-server hour; configure for the symbol/session.
+input int SessionEndHour = 18;  // Broker-server hour; configure for the symbol/session.
+
+input bool EnableTradeExecution = false;
+input bool EnableLimitEntries = false;
+input bool EnablePartialExit = true;
+input double PartialExitAtR1 = 2.0;
+input double PartialExitPercent1 = 50.0;
+input double PartialExitAtR2 = 3.0;
+input double PartialExitPercent2 = 25.0;
+input bool TrailRunnerAfterSecondPartial = true;
+input bool TightenStopAfterStrongEntryBar = true;
+input int StrongEntryBarStopOffsetTicks = 1;
+input bool ExitOnQualifiedOppositeSignal = true;
+input bool MoveStopToBreakevenAtOneR = false;
+input bool EnableSwingTrailingStop = false;
+input int SwingTrailLookbackBars = 20;
+input bool EnableScaleIn = false; // Intentionally rejected in V2 until separately tested.
+input ulong MagicNumber = 320032;
+
+CTrade trade;
+datetime g_lastEntryBar = 0;
+datetime g_partialExitRetryAfter = 0;
+ulong g_partialExitRetryTicket = 0;
+datetime g_entryStopRetryAfter = 0;
+ulong g_entryStopRetryTicket = 0;
+string g_lastSignalKey = "";
+
+struct SContext
+{
+   int trend;
+   bool range;
+   bool tightRange;
+   bool triangle;
+   bool bullMA;
+   bool bearMA;
+   bool firstMAGapUp;
+   bool firstMAGapDown;
+   bool twentyGapUp;
+   bool twentyGapDown;
+   bool pullbackWeakening;
+   bool doubleTop;
+   bool doubleBottom;
+   bool headShouldersTop;
+   bool headShouldersBottom;
+   bool wedgeUp;
+   bool wedgeDown;
+   bool breakoutUp;
+   bool breakoutDown;
+   bool strongBreakoutUp;
+   bool strongBreakoutDown;
+   bool followThroughUp;
+   bool followThroughDown;
+   bool failedBreakoutUp;
+   bool failedBreakoutDown;
+   bool steepTrend;
+   bool reversalLineBreakUp;
+   bool reversalLineBreakDown;
+   bool channelOvershootReversalUp;
+   bool channelOvershootReversalDown;
+   bool tightRangeFailedBreakoutUp;
+   bool tightRangeFailedBreakoutDown;
+   bool breakoutPullbackUp;
+   bool breakoutPullbackDown;
+   bool tightRangeBullFade;
+   bool tightRangeBearFade;
+   bool gapUp;
+   bool gapDown;
+   bool high1;
+   bool high2;
+   bool high3;
+   bool high4;
+   bool low1;
+   bool low2;
+   bool low3;
+   bool low4;
+   bool abcBullCorrection;
+   bool abcBearCorrection;
+   bool magnetAbove;
+   bool magnetBelow;
+   bool priorFailureMagnet;
+   bool duelingLines;
+   bool sessionOK;
+   bool nearRangeLow;
+   bool nearRangeHigh;
+   int legCount;
+   int attemptCount;
+   int highLowCount;
+   int highBarCount;
+   int lowBarCount;
+   double ma;
+   double atrLike;
+   double rangeHigh;
+   double rangeLow;
+   double breakoutTestLevelUp;
+   double breakoutTestLevelDown;
+   double measuredMoveUp;
+   double measuredMoveDown;
+   double nearestMagnetAbove;
+   double nearestMagnetBelow;
+   double failedBullReversalTarget;
+   double failedBearReversalTarget;
+   double bullTrendLineNow;
+   double bearTrendLineNow;
+};
+
+struct SSetup
+{
+   int direction;
+   int reasonGroups;
+   bool isRangeSetup;
+   bool useLimit;
+   bool usePartialExit;
+   double entry;
+   double stop;
    double target;
    double expectedValue;
    string label;
@@ -956,7 +1105,9 @@ bool TryPendingOppositeSignalExit(const ulong ticket)
       return false;
 
    bool sent = trade.PositionClose(ticket);
-   if(sent && TradeResultSucceeded())
+   bool requestAccepted = (sent && TradeResultSucceeded());
+   bool positionStillOpen = PositionSelectByTicket(ticket);
+   if(requestAccepted && !positionStillOpen)
    {
       GlobalVariableDel(requestKey);
       if(GlobalVariableCheck(retryKey)) GlobalVariableDel(retryKey);
@@ -964,8 +1115,11 @@ bool TryPendingOppositeSignalExit(const ulong ticket)
       return true;
    }
    GlobalVariableSet(retryKey, (double)(TimeCurrent() + 5));
-   Print("OPPOSITE-SIGNAL EXIT REJECTED; retry in 5 seconds: ",
-         trade.ResultRetcode(), " | ", trade.ResultRetcodeDescription());
+   if(requestAccepted && positionStillOpen)
+      Print("OPPOSITE-SIGNAL EXIT INCOMPLETE; position remains open, retry in 5 seconds.");
+   else
+      Print("OPPOSITE-SIGNAL EXIT REJECTED; retry in 5 seconds: ",
+            trade.ResultRetcode(), " | ", trade.ResultRetcodeDescription());
    return false;
 }
 
