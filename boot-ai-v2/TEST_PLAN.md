@@ -1,4 +1,4 @@
-# MT5 validation plan (not yet executed)
+# MT5 validation plan
 
 The EA must stay in analysis-only mode while this plan is pending. `EnableTradeExecution` defaults to `false`; if it is enabled later, the current draft blocks non-demo accounts.
 
@@ -19,17 +19,28 @@ The EA must stay in analysis-only mode while this plan is pending. `EnableTradeE
 ## 3. Signal checks in visual Strategy Tester
 
 - Range edges, range middle, tight range, triangle breakout, and breakout follow-through.
-- Strong and weak breakouts; failed breakouts in both directions; retests and gaps.
-- High 1–4 / Low 1–4 proxies, double tops/bottoms, head-and-shoulders proxies, wedges, and pullback weakening.
+- Strong and weak breakouts; failed breakouts in both directions; breakout pullbacks/tests in both directions, including deep but valid tests, decisive closes through the level, stale breakouts, and failed retests; and gaps.
+- Chapter 9 failed-reversal magnets: verify trigger then later stop breach, direction-specific signal-bar level, every qualifying level retained, same-bar ambiguity ignored, and only closed bars considered.
+- Chapter 19 dueling lines: verify pivot selection, rising-low and falling-high slopes, projection to the current closed bar, and confluence only when both lines and price are within the fixed half-ATR distance.
+- Chapter 15 session filter: verify exact start/end boundaries, overnight windows, disabled mode, and that backtests use each closed bar timestamp rather than current workstation time.
+- High 1–4 / Low 1–4 and ABC H2/L2 proxies (including no intermediate countertrend leg, trading-range context, and reset cases), double tops/bottoms, head-and-shoulders proxies, wedges, and pullback weakening.
+- Tight-range gate: no candidate by default except a failed strong breakout that exceeded the range by at least three ticks or a small directional reversal bar at a range edge; verify the explicit research override separately.
+- Chapter 26 steep-trend gate: verify trend-strength classification, line breaks use only closed bars and pre-existing pivots, countertrend candidates are skipped without a qualifying line break or wedge/failure reversal proxy, and qualifying cases still meet the two-reason gate.
 - Moving-average gap and twenty-gap counters, session filter boundaries, and daily-level magnets.
 - Verify each printed setup against the manually labeled chart examples. No false positive should be silently treated as a confirmed trade.
 
 ## 4. Order and risk checks on demo only
 
 - Confirm risk sizing with `OrderCalcProfit`, volume step/minimum, symbol tick size, and stop distance. If the minimum lot would exceed the risk budget, the EA must skip the order.
+- Chapter 25 EV gate: verify the configured probability and spread/slippage/commission assumptions, verify candidates at or below `MinimumExpectedValuePoints` are rejected and logged, and confirm positive EV is not treated as evidence of profitability without out-of-sample calibration.
 - Confirm pending stop/limit price, expiration, attached stop and target, retcode handling, and cancellation after a fill or partial fill.
+- Confirm enabled range-edge limit entries use `LimitEntryRiskMultiplier` for position sizing and that the default 0.50 value halves the stop-based risk amount without changing the stop distance; confirm the limit-entry switch remains off by default.
+- Confirm an unfilled managed stop/limit entry is deleted after bid reaches a buy order's attached stop or ask reaches a sell order's attached stop; verify delete rejection is logged and retried on later ticks. Confirm switching `EnableTradeExecution` off deletes all managed pending entries without touching unrelated orders.
 - Test both hedging and netting account modes; confirm partial close reduces the intended position and never reverses it.
+- For Chapter 31 staged exits, verify each tranche is a percentage of the initial volume (not the remaining volume), intrabar threshold crossings are handled on ticks even if price retreats before the bar closes, a price gap beyond both thresholds processes both tranches once, rejected close requests retry after the cooldown, and broker-minimum rounding cannot reverse or fully close the position unexpectedly.
 - Confirm trailing/breakeven changes only tighten risk; rejected modify/close/delete operations remain visible in the log and are retried where appropriate.
+- For swing trailing, confirm only a pivot with both older and newer closed-bar confirmation is used, the configured lookback is respected, no forming bar is read, and the stop never loosens or crosses the current market.
+- Confirm each trade style uses its configured max-bar exit and that changing `TradeStyle` or its max-bar inputs after a pending entry is placed (and after it fills) does not alter the locked horizon.
 - Confirm one position/pending order per symbol and magic number; confirm unrelated netting exposure blocks a new order.
 - Confirm `EnableTradeExecution=false` creates no order under any signal and non-demo accounts are rejected when execution is enabled.
 
@@ -41,5 +52,14 @@ The EA must stay in analysis-only mode while this plan is pending. `EnableTradeE
 - Run demo forward testing only after the source audit, successful build, visual signal checks, and historical evaluation are complete.
 - Agree on acceptable drawdown and minimum evidence thresholds before treating the demo phase as a pass.
 
-No compile, Strategy Tester, or demo run has been performed for this draft.
+## Current recorded run
 
+- MetaEditor compiled V2 with 0 errors and 0 warnings.
+- A user-provided Strategy Tester Journal screenshot shows a one-year EURUSDm M15 run ending with a final balance of $5,125.09 from a $10,000 deposit (about -48.75%).
+- The local MetaTester journal confirms the test passed in 25.413 seconds with 11,313,866 ticks and 22,375 bars, then shut down normally. The “Not Responding” label in the screenshot was transient/stale UI state, not evidence that the test was still running.
+- The tester's Backtest tab shows 2,170 trades, 873 winners (40.23%), profit factor 0.71, expected payoff -$2.25 per trade, and maximal balance drawdown $5,023.92 (50.08%). Gross profit was $12,228.45 against gross loss $17,103.36. The settings used zero latency/ideal execution and $0 commission, so this is optimistic about costs despite the loss.
+- This run predates the latest Chapter 9, 15, 17, and 19 changes. Treat it as a failed baseline for the earlier heuristic draft; do not use it to claim anything about a complete or validated Al Brooks strategy.
+- A second one-year run of the separate research build (with the Chapter 3/5 retest detector and Chapter 9/15/17/19 updates) ended at $4,623.96, net -$5,376.04, with 2,139 trades, 38.94% winners, profit factor 0.67, expected payoff -$2.51, and maximal balance drawdown $5,498.50 (54.98%). It completed in 38 seconds over the same 11,313,866 ticks and 22,375 bars. This result is worse than the original baseline. Both runs used zero latency and no commission. The second run is now the baseline for the next tight-range gate comparison.
+- A third build adds `AllowTightRangeSignals=false` by default and a strong-breakout/follow-through exception. MetaEditor compiled it with 0 errors and 0 warnings, and its separate EX5 copy is staged in the MT5 Experts folder. It has not been tested yet.
+- The latest build includes the prior Chapter 26/28 gates, configurable two-stage Chapter 31 scale-out (50% of initial size at 1R and 25% at 2R by default), and continues to reject scale-in. Position management now checks price thresholds on each tick while entry screening remains closed-bar based; rejected partial closes are retried after a five-second cooldown, and unsafe tranche sizes are explicitly skipped. Chapter 25 exposes a nonnegative `MinimumExpectedValuePoints` floor (default 0) and logs the estimate and threshold when a candidate fails it; win probability remains an uncalibrated user assumption. MetaEditor compiled this version with 0 errors and 0 warnings (83,654-byte EX5); the research copy is staged as `BootAI_V2_Research_Ch31_20261126.ex5`, matching hash `B1FBDA1EA4C1EB2AB0DB042F0CEA6671B3657F0CE6C89A855FB088192E919259`. Matching tester `.ini` and `.set` presets enable order execution only inside Strategy Tester. No historical result exists for this newest build; the latest MetaTester log remains the earlier run ending at $4,623.96. The source EA default remains `EnableTradeExecution=false`, and the base `TradingBot_V2.ex5` was not overwritten. A command-line run attempt did not start because the existing terminal instance ignored the new startup configuration; the agent log timestamp did not change. Do not claim the new build was tested.
+- The user changed `EnableTradeExecution` to true in Strategy Tester inputs for that simulation. The EA source default remains false; live-chart execution must remain off.

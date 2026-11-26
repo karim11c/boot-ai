@@ -11,11 +11,14 @@ input ENUM_TIMEFRAMES TrendTF = PERIOD_H1;
 input int BarsToRead = 100;
 input int RangeLookback = 20;
 input int TrendBarsPerLeg = 5;
+input double SteepTrendDisplacementATR = 2.0;
 input int MovingAveragePeriod = 20;
 input double RangeOverlapThreshold = 0.55;
 input double StrongBodyShare = 0.55;
+input double SmallBarRangeATR = 0.50;
 input double RangeEdgePercent = 25.0;
 input int MinReasonGroups = 2;
+input bool AllowTightRangeSignals = false;
 
 enum ENUM_BOOTAI_STYLE
 {
@@ -25,26 +28,37 @@ enum ENUM_BOOTAI_STYLE
 };
 
 input ENUM_BOOTAI_STYLE TradeStyle = STYLE_INTRADAY_SWING;
+input int MaxBarsForScalp = 1;
+input int MaxBarsForIntraday = 40;
+input int MaxBarsForSwing = 160;
 input double EstimatedWinProbability = 0.50;
+input double MinimumExpectedValuePoints = 0.0;
 input double RiskPercent = 0.25;
 input double TargetRR = 2.0;
 input double CommissionPerLotRoundTurn = 0.0;
 input int SlippagePointsEstimate = 2;
+input double LimitEntryRiskMultiplier = 0.50;
 input bool UseSessionFilter = false;
-input int SessionStartHour = 7;
-input int SessionEndHour = 18;
+input int SessionStartHour = 7; // Broker-server hour; configure for the symbol/session.
+input int SessionEndHour = 18;  // Broker-server hour; configure for the symbol/session.
 
 input bool EnableTradeExecution = false;
 input bool EnableLimitEntries = false;
 input bool EnablePartialExit = true;
+input double PartialExitAtR1 = 1.0;
+input double PartialExitPercent1 = 50.0;
+input double PartialExitAtR2 = 2.0;
+input double PartialExitPercent2 = 25.0;
 input bool MoveStopToBreakevenAtOneR = false;
 input bool EnableSwingTrailingStop = false;
+input int SwingTrailLookbackBars = 20;
 input bool EnableScaleIn = false; // Intentionally rejected in V2 until separately tested.
 input ulong MagicNumber = 320032;
 
 CTrade trade;
 datetime g_lastEntryBar = 0;
-datetime g_lastManageBar = 0;
+datetime g_partialExitRetryAfter = 0;
+ulong g_partialExitRetryTicket = 0;
 string g_lastSignalKey = "";
 
 struct SContext
@@ -74,10 +88,29 @@ struct SContext
    bool followThroughDown;
    bool failedBreakoutUp;
    bool failedBreakoutDown;
+   bool steepTrend;
+   bool reversalLineBreakUp;
+   bool reversalLineBreakDown;
+   bool channelOvershootReversalUp;
+   bool channelOvershootReversalDown;
+   bool tightRangeFailedBreakoutUp;
+   bool tightRangeFailedBreakoutDown;
+   bool breakoutPullbackUp;
+   bool breakoutPullbackDown;
+   bool tightRangeBullFade;
+   bool tightRangeBearFade;
    bool gapUp;
    bool gapDown;
+   bool high1;
    bool high2;
+   bool high3;
+   bool high4;
+   bool low1;
    bool low2;
+   bool low3;
+   bool low4;
+   bool abcBullCorrection;
+   bool abcBearCorrection;
    bool magnetAbove;
    bool magnetBelow;
    bool priorFailureMagnet;
@@ -88,14 +121,22 @@ struct SContext
    int legCount;
    int attemptCount;
    int highLowCount;
+   int highBarCount;
+   int lowBarCount;
    double ma;
    double atrLike;
    double rangeHigh;
    double rangeLow;
+   double breakoutTestLevelUp;
+   double breakoutTestLevelDown;
    double measuredMoveUp;
    double measuredMoveDown;
    double nearestMagnetAbove;
    double nearestMagnetBelow;
+   double failedBullReversalTarget;
+   double failedBearReversalTarget;
+   double bullTrendLineNow;
+   double bearTrendLineNow;
 };
 
 struct SSetup
@@ -204,6 +245,18 @@ int DetectTrend(const MqlRates &rates[])
    return 0;
 }
 
+bool IsSteepTrend(const MqlRates &rates[], const int direction)
+{
+   int bars = MinInt(TrendBarsPerLeg, ArraySize(rates) - 1);
+   if(direction == 0 || bars < 3) return false;
+   double averageRange = AverageRange(rates, 0, bars);
+   if(averageRange <= 0.0) return false;
+   double directionalMove = (double)direction * (rates[0].close - rates[bars-1].close);
+   int overlapCount = CountOverlaps(rates, 0, bars);
+   return (directionalMove >= averageRange * SteepTrendDisplacementATR &&
+           overlapCount <= (bars - 1) / 2);
+}
+
 void GetRangeBounds(const MqlRates &rates[], const int start, const int count,
                     double &high, double &low)
 {
@@ -217,6 +270,68 @@ void GetRangeBounds(const MqlRates &rates[], const int start, const int count,
    }
    if(high == -DBL_MAX) high = 0.0;
    if(low == DBL_MAX) low = 0.0;
+}
+
+// Chapters 3 and 5 proxy: find a prior range breakout followed by a pullback
+// that tests the boundary without a decisive close back through it, then a
+// current-bar rejection in the breakout direction. Tolerances are engineering
+// estimates; test windows are limited to available closed-bar history.
+void FindRecentBreakoutPullbackTests(const MqlRates &rates[], const int rangeBars,
+                                    const int maxAge, const double tolerance,
+                                    bool &bullTest, double &bullLevel,
+                                    bool &bearTest, double &bearLevel)
+{
+   bullTest = false;
+   bearTest = false;
+   bullLevel = 0.0;
+   bearLevel = 0.0;
+   int size = ArraySize(rates);
+   int ageScan = MinInt(maxAge, size - rangeBars - 2);
+   if(ageScan < 3) return;
+
+   for(int i = 3; i <= ageScan; i++)
+   {
+      int sample = MinInt(rangeBars, size - i - 1);
+      if(sample < 6) continue;
+      double priorHigh, priorLow;
+      GetRangeBounds(rates, i + 1, sample, priorHigh, priorLow);
+
+      bool brokeUp = (rates[i].close > priorHigh && rates[i+1].close <= priorHigh);
+      if(brokeUp)
+      {
+         bool touched = false, held = true;
+         for(int j = i - 1; j >= 0; j--)
+         {
+            if(rates[j].close < priorHigh - tolerance) { held = false; break; }
+            if(rates[j].low <= priorHigh + tolerance) touched = true;
+         }
+         if(held && touched && rates[0].close > priorHigh &&
+            BarDirection(rates[0]) > 0 && rates[0].high > rates[1].high)
+         {
+            bullTest = true;
+            bullLevel = priorHigh;
+            return;
+         }
+      }
+
+      bool brokeDown = (rates[i].close < priorLow && rates[i+1].close >= priorLow);
+      if(brokeDown)
+      {
+         bool touched = false, held = true;
+         for(int j = i - 1; j >= 0; j--)
+         {
+            if(rates[j].close > priorLow + tolerance) { held = false; break; }
+            if(rates[j].high >= priorLow - tolerance) touched = true;
+         }
+         if(held && touched && rates[0].close < priorLow &&
+            BarDirection(rates[0]) < 0 && rates[0].low < rates[1].low)
+         {
+            bearTest = true;
+            bearLevel = priorLow;
+            return;
+         }
+      }
+   }
 }
 
 int CountDirectionChanges(const MqlRates &rates[], const int start, const int count)
@@ -277,6 +392,64 @@ int CountApproximateLegs(const MqlRates &rates[], const int bars)
       if(pivotHigh || pivotLow) pivots++;
    }
    return MinInt(4, pivots);
+}
+
+// Brooks bar counting: during a pullback, a High 1/2/3/4 is an occurrence
+// where a bar's high exceeds the prior bar's high; Low 1/2/3/4 is the mirror.
+// This finite-window detector is still an approximation: it cannot resolve
+// every nested/fractal correction described in the source.
+int CurrentPullbackSignalCount(const MqlRates &rates[], const bool countHighs,
+                               const int lookback, bool &abcCorrection)
+{
+   abcCorrection = false;
+   int n = MinInt(lookback, ArraySize(rates) - 1);
+   if(n < 3) return 0;
+
+   bool pullback = false;
+   bool secondLegAfterFirstSignal = false;
+   int count = 0;
+   int latestSignalCount = 0;
+   double trendExtreme = (countHighs ? rates[n].high : rates[n].low);
+   double tick = TickSize();
+
+   // CopyRates with a series array is indexed newest-first, so scan from old
+   // bars toward index zero (the latest closed bar).
+   for(int i = n - 1; i >= 0; i--)
+   {
+      bool counterBar = (countHighs ?
+                        (rates[i].low < rates[i+1].low || rates[i].close < rates[i+1].close) :
+                        (rates[i].high > rates[i+1].high || rates[i].close > rates[i+1].close));
+      bool secondLegWasAlreadySeen = secondLegAfterFirstSignal;
+      if(counterBar)
+      {
+         if(count == 1) secondLegAfterFirstSignal = true;
+         pullback = true;
+      }
+
+      bool signal = (countHighs ? rates[i].high > rates[i+1].high + tick :
+                                  rates[i].low < rates[i+1].low - tick);
+      if(pullback && signal)
+      {
+         count = MinInt(4, count + 1);
+         if(i == 0) latestSignalCount = count;
+         if(i == 0 && count == 2 && secondLegWasAlreadySeen)
+            abcCorrection = true;
+      }
+
+      bool trendResumed = (countHighs ? rates[i].high > trendExtreme + tick :
+                                        rates[i].low < trendExtreme - tick);
+      if(trendResumed)
+      {
+         trendExtreme = (countHighs ? rates[i].high : rates[i].low);
+         if(i > 0)
+         {
+            pullback = false;
+            count = 0;
+            secondLegAfterFirstSignal = false;
+         }
+      }
+   }
+   return latestSignalCount;
 }
 
 void DetectDoubleTopBottom(const MqlRates &rates[], const double tolerance,
@@ -341,11 +514,13 @@ bool DetectWedgeDown(const MqlRates &rates[])
    return (p0 < p1 && p1 < p2 && p2 < p3 && (p1-p0) < (p2-p1) && (p2-p1) < (p3-p2));
 }
 
-bool InConfiguredSession()
+bool InConfiguredSession(const datetime signalBarTime)
 {
    if(!UseSessionFilter) return true;
    MqlDateTime now;
-   TimeToStruct(TimeTradeServer(), now);
+   // Use the closed signal bar's timestamp so historical runs never depend on
+   // the workstation clock or the wall-clock time when the EA is evaluated.
+   if(!TimeToStruct(signalBarTime, now)) return false;
    int current = now.hour * 60 + now.min;
    int start = SessionStartHour * 60;
    int finish = SessionEndHour * 60;
@@ -354,9 +529,64 @@ bool InConfiguredSession()
    return (current >= start || current < finish);
 }
 
+// Chapter 9 proxy: a countertrend signal bar is treated as a failed entry only
+// when its stop-entry extreme is crossed and a later closed bar breaches the
+// signal-bar protective extreme. Keep every detected signal-bar extreme as a
+// separate candidate magnet. This is an engineering approximation, not a full
+// Brooks setup classifier.
+void FindPriorFailedReversalSignalMagnets(const MqlRates &rates[],
+                                          const double current,
+                                          double &failedBullTargets[], int &bullCount,
+                                          double &failedBearTargets[], int &bearCount)
+{
+   bullCount = 0;
+   bearCount = 0;
+   ArrayInitialize(failedBullTargets, 0.0);
+   ArrayInitialize(failedBearTargets, 0.0);
+   int scan = MinInt(100, ArraySize(rates) - 4);
+   double tick = TickSize();
+   for(int i = 4; i < scan; i++)
+   {
+      bool bearSignalInBullMove = (BarDirection(rates[i]) < 0 && BodyShare(rates[i]) >= 0.45 &&
+                                   rates[i+1].close >= rates[i+2].close);
+      bool bullSignalInBearMove = (BarDirection(rates[i]) > 0 && BodyShare(rates[i]) >= 0.45 &&
+                                   rates[i+1].close <= rates[i+2].close);
+      bool bearEntryTriggered = false;
+      bool bullEntryTriggered = false;
+      bool failedBearEntry = false;
+      bool failedBullEntry = false;
+      // Visit the three bars after the signal in chronological order. A stop
+      // and its protective stop touched in the same bar is deliberately ignored
+      // because OHLC data cannot reveal which was hit first.
+      for(int step = 3; step >= 1; step--)
+      {
+         int bar = i - step;
+         if(bar < 0) continue;
+         if(bearEntryTriggered && rates[bar].high > rates[i].high + tick)
+            failedBearEntry = true;
+         if(bullEntryTriggered && rates[bar].low < rates[i].low - tick)
+            failedBullEntry = true;
+         if(bearSignalInBullMove && rates[bar].low < rates[i].low - tick)
+            bearEntryTriggered = true;
+         if(bullSignalInBearMove && rates[bar].high > rates[i].high + tick)
+            bullEntryTriggered = true;
+      }
+      if(bearSignalInBullMove && failedBearEntry && rates[i].low < current && bearCount <= 198)
+      {
+         failedBearTargets[bearCount++] = rates[i].low;
+         failedBearTargets[bearCount++] = rates[i].low - tick; // approximate stop-entry price
+      }
+      if(bullSignalInBearMove && failedBullEntry && rates[i].high > current && bullCount <= 198)
+      {
+         failedBullTargets[bullCount++] = rates[i].high;
+         failedBullTargets[bullCount++] = rates[i].high + tick; // approximate stop-entry price
+      }
+   }
+}
+
 void FindMagnets(const MqlRates &rates[], SContext &ctx)
 {
-   double candidates[7];
+   double candidates[407];
    candidates[0] = ctx.ma;
    candidates[1] = iHigh(_Symbol, PERIOD_D1, 1);
    candidates[2] = iLow(_Symbol, PERIOD_D1, 1);
@@ -364,6 +594,26 @@ void FindMagnets(const MqlRates &rates[], SContext &ctx)
    candidates[4] = ctx.rangeLow;
    candidates[5] = 0.0;
    candidates[6] = 0.0;
+   double failedBullTargets[200], failedBearTargets[200];
+   int failedBullCount = 0, failedBearCount = 0;
+   FindPriorFailedReversalSignalMagnets(rates, rates[0].close,
+                                        failedBullTargets, failedBullCount,
+                                        failedBearTargets, failedBearCount);
+   for(int n = 0; n < 200; n++)
+   {
+      candidates[7+n] = failedBullTargets[n];
+      candidates[207+n] = failedBearTargets[n];
+   }
+   ctx.failedBullReversalTarget = 0.0;
+   ctx.failedBearReversalTarget = 0.0;
+   for(int n = 0; n < failedBullCount; n++)
+      if(failedBullTargets[n] > rates[0].close &&
+         (ctx.failedBullReversalTarget == 0.0 || failedBullTargets[n] < ctx.failedBullReversalTarget))
+         ctx.failedBullReversalTarget = failedBullTargets[n];
+   for(int n = 0; n < failedBearCount; n++)
+      if(failedBearTargets[n] < rates[0].close &&
+         (ctx.failedBearReversalTarget == 0.0 || failedBearTargets[n] > ctx.failedBearReversalTarget))
+         ctx.failedBearReversalTarget = failedBearTargets[n];
    int scan = MinInt(20, ArraySize(rates) - 2);
    for(int i = 2; i < scan; i++)
    {
@@ -378,7 +628,7 @@ void FindMagnets(const MqlRates &rates[], SContext &ctx)
    double current = rates[0].close;
    ctx.nearestMagnetAbove = DBL_MAX;
    ctx.nearestMagnetBelow = -DBL_MAX;
-   for(int i = 0; i < 7; i++)
+   for(int i = 0; i < 407; i++)
    {
       if(candidates[i] <= 0.0) continue;
       if(candidates[i] > current && candidates[i] < ctx.nearestMagnetAbove)
@@ -388,11 +638,44 @@ void FindMagnets(const MqlRates &rates[], SContext &ctx)
    }
    ctx.magnetAbove = (ctx.nearestMagnetAbove < DBL_MAX);
    ctx.magnetBelow = (ctx.nearestMagnetBelow > -DBL_MAX);
+   ctx.priorFailureMagnet = (ctx.failedBullReversalTarget > 0.0 ||
+                             ctx.failedBearReversalTarget > 0.0);
+}
+
+// Chapter 19 approximation: fit a line through the two newest confirmed swing
+// lows (support) or highs (resistance), then project it to the current bar.
+// Series index decreases toward the present, so slope is expressed per bar.
+bool FitRecentPivotTrendLine(const MqlRates &rates[], const bool useLows,
+                             const int lookback, double &projected,
+                             double &slope)
+{
+   projected = 0.0;
+   slope = 0.0;
+   int scan = MinInt(lookback, ArraySize(rates) - 2);
+   int newer = -1, older = -1;
+   for(int i = 2; i < scan; i++)
+   {
+      bool pivot = (useLows ?
+                    (rates[i].low <= rates[i-1].low && rates[i].low < rates[i+1].low) :
+                    (rates[i].high >= rates[i-1].high && rates[i].high > rates[i+1].high));
+      if(!pivot) continue;
+      if(newer < 0) newer = i;
+      else { older = i; break; }
+   }
+   if(newer < 0 || older < 0 || older <= newer) return false;
+   double newerPrice = (useLows ? rates[newer].low : rates[newer].high);
+   double olderPrice = (useLows ? rates[older].low : rates[older].high);
+   slope = (newerPrice - olderPrice) / (double)(older - newer);
+   if(useLows && slope <= 0.0) return false;
+   if(!useLows && slope >= 0.0) return false;
+   projected = newerPrice + slope * (double)newer;
+   return (projected > 0.0);
 }
 
 void AnalyzeContext(const MqlRates &entry[], const MqlRates &trend[], SContext &ctx)
 {
    ctx.trend = DetectTrend(trend);
+   ctx.steepTrend = IsSteepTrend(trend, ctx.trend);
    int lookback = MinInt(RangeLookback, ArraySize(entry) - 2);
    GetRangeBounds(entry, 1, lookback, ctx.rangeHigh, ctx.rangeLow);
    int flips = CountDirectionChanges(entry, 0, lookback);
@@ -425,10 +708,27 @@ void AnalyzeContext(const MqlRates &entry[], const MqlRates &trend[], SContext &
                           entry[0].close > entry[1].close);
    ctx.followThroughDown = (ArraySize(entry) > 1 && entry[1].close < priorLow &&
                             entry[0].close < entry[1].close);
+   double tick = TickSize();
+   bool strongBreakAboveRange = (ArraySize(entry) > 2 &&
+                                 entry[1].close > priorHigh &&
+                                 entry[1].high - priorHigh >= 3.0 * tick &&
+                                 BarDirection(entry[1]) > 0 &&
+                                 BodyShare(entry[1]) >= StrongBodyShare);
+   bool strongBreakBelowRange = (ArraySize(entry) > 2 &&
+                                 entry[1].close < priorLow &&
+                                 priorLow - entry[1].low >= 3.0 * tick &&
+                                 BarDirection(entry[1]) < 0 &&
+                                 BodyShare(entry[1]) >= StrongBodyShare);
    ctx.failedBreakoutUp = (ArraySize(entry) > 2 && entry[1].high > priorHigh &&
                            entry[0].close < priorHigh);
    ctx.failedBreakoutDown = (ArraySize(entry) > 2 && entry[1].low < priorLow &&
                              entry[0].close > priorLow);
+   ctx.tightRangeFailedBreakoutUp = (strongBreakAboveRange && entry[0].close < priorHigh);
+   ctx.tightRangeFailedBreakoutDown = (strongBreakBelowRange && entry[0].close > priorLow);
+   double breakoutTestTolerance = MaxDouble(TickSize() * 3.0, ctx.atrLike * 0.10);
+   FindRecentBreakoutPullbackTests(entry, RangeLookback, 80, breakoutTestTolerance,
+                                   ctx.breakoutPullbackUp, ctx.breakoutTestLevelUp,
+                                   ctx.breakoutPullbackDown, ctx.breakoutTestLevelDown);
    ctx.twentyGapUp = false;
    ctx.twentyGapDown = false;
    int above = 0, below = 0;
@@ -455,19 +755,38 @@ void AnalyzeContext(const MqlRates &entry[], const MqlRates &trend[], SContext &
                        ctx.headShouldersTop, ctx.headShouldersBottom);
    ctx.wedgeUp = DetectWedgeUp(entry);
    ctx.wedgeDown = DetectWedgeDown(entry);
+   ctx.channelOvershootReversalUp = (ctx.trend < 0 && ctx.wedgeDown &&
+                                     ctx.failedBreakoutDown && BarDirection(entry[0]) > 0);
+   ctx.channelOvershootReversalDown = (ctx.trend > 0 && ctx.wedgeUp &&
+                                       ctx.failedBreakoutUp && BarDirection(entry[0]) < 0);
    ctx.legCount = CountApproximateLegs(entry, 20);
-   ctx.attemptCount = MinInt(4, CountDirectionChanges(entry, 0, 10) / 2 + 1);
-   ctx.highLowCount = ctx.attemptCount;
-   ctx.high2 = (ctx.range && ctx.attemptCount >= 2 && entry[0].close > entry[0].open &&
-                entry[0].close > entry[1].high &&
-                entry[0].close <= ctx.rangeLow + (ctx.rangeHigh-ctx.rangeLow) * RangeEdgePercent/100.0);
-   ctx.low2 = (ctx.range && ctx.attemptCount >= 2 && entry[0].close < entry[0].open &&
-               entry[0].close < entry[1].low &&
-               entry[0].close >= ctx.rangeHigh - (ctx.rangeHigh-ctx.rangeLow) * RangeEdgePercent/100.0);
+   ctx.highBarCount = CurrentPullbackSignalCount(entry, true, 20, ctx.abcBullCorrection);
+   ctx.lowBarCount = CurrentPullbackSignalCount(entry, false, 20, ctx.abcBearCorrection);
+   ctx.highLowCount = MaxInt(ctx.highBarCount, ctx.lowBarCount);
+   ctx.attemptCount = ctx.highLowCount;
    double edgeSize = (ctx.rangeHigh - ctx.rangeLow) * RangeEdgePercent / 100.0;
-   ctx.nearRangeLow = (ctx.range && edgeSize > 0.0 && entry[0].close <= ctx.rangeLow + edgeSize);
-   ctx.nearRangeHigh = (ctx.range && edgeSize > 0.0 && entry[0].close >= ctx.rangeHigh - edgeSize);
-   ctx.sessionOK = InConfiguredSession();
+   bool rangeContext = (ctx.range || ctx.tightRange);
+   ctx.nearRangeLow = (rangeContext && edgeSize > 0.0 && entry[0].close <= ctx.rangeLow + edgeSize);
+   ctx.nearRangeHigh = (rangeContext && edgeSize > 0.0 && entry[0].close >= ctx.rangeHigh - edgeSize);
+   bool smallSignalBar = (ctx.atrLike > 0.0 &&
+                          BarRange(entry[0]) <= ctx.atrLike * SmallBarRangeATR);
+   ctx.tightRangeBullFade = (ctx.tightRange && ctx.nearRangeLow && smallSignalBar &&
+                             BarDirection(entry[0]) > 0);
+   ctx.tightRangeBearFade = (ctx.tightRange && ctx.nearRangeHigh && smallSignalBar &&
+                             BarDirection(entry[0]) < 0);
+   ctx.high1 = (ctx.highBarCount == 1);
+   ctx.high2 = (ctx.highBarCount == 2 &&
+                ((ctx.trend > 0 && entry[0].close >= ctx.ma) || ctx.nearRangeLow));
+   ctx.high3 = (ctx.highBarCount == 3);
+   ctx.high4 = (ctx.highBarCount == 4);
+   ctx.low1 = (ctx.lowBarCount == 1);
+   ctx.low2 = (ctx.lowBarCount == 2 &&
+               ((ctx.trend < 0 && entry[0].close <= ctx.ma) || ctx.nearRangeHigh));
+   ctx.low3 = (ctx.lowBarCount == 3);
+   ctx.low4 = (ctx.lowBarCount == 4);
+   ctx.abcBullCorrection = (ctx.abcBullCorrection && ctx.trend > 0 && ctx.high2);
+   ctx.abcBearCorrection = (ctx.abcBearCorrection && ctx.trend < 0 && ctx.low2);
+   ctx.sessionOK = InConfiguredSession(entry[0].time);
    double oldHigh, oldLow;
    GetRangeBounds(entry, 5, MinInt(10, ArraySize(entry)-5), oldHigh, oldLow);
    double leg = MaxDouble(oldHigh-oldLow, ctx.atrLike);
@@ -476,10 +795,33 @@ void AnalyzeContext(const MqlRates &entry[], const MqlRates &trend[], SContext &
    if(ctx.gapUp) ctx.measuredMoveUp = entry[0].close + (entry[0].low-entry[1].high);
    if(ctx.gapDown) ctx.measuredMoveDown = entry[0].close - (entry[1].low-entry[0].high);
    FindMagnets(entry, ctx);
-   ctx.priorFailureMagnet = (ctx.failedBreakoutUp || ctx.failedBreakoutDown);
-   ctx.duelingLines = (ctx.atrLike > 0.0 &&
-                       MathAbs(entry[0].close - ctx.ma) <= ctx.atrLike * 0.35 &&
-                       ((ctx.magnetAbove && ctx.magnetBelow) || ctx.doubleTop || ctx.doubleBottom));
+   double bullLineSlope = 0.0, bearLineSlope = 0.0;
+   bool hasBullSupportLine = FitRecentPivotTrendLine(entry, true, 100,
+                                                      ctx.bullTrendLineNow, bullLineSlope);
+   bool hasBearResistanceLine = FitRecentPivotTrendLine(entry, false, 100,
+                                                         ctx.bearTrendLineNow, bearLineSlope);
+   double priorBullLine = ctx.bullTrendLineNow - bullLineSlope;
+   double priorBearLine = ctx.bearTrendLineNow - bearLineSlope;
+   ctx.reversalLineBreakDown = (ctx.trend > 0 && hasBullSupportLine &&
+                                BarDirection(entry[0]) < 0 &&
+                                BodyShare(entry[0]) >= StrongBodyShare &&
+                                entry[1].close >= priorBullLine &&
+                                entry[0].close < ctx.bullTrendLineNow);
+   ctx.reversalLineBreakUp = (ctx.trend < 0 && hasBearResistanceLine &&
+                              BarDirection(entry[0]) > 0 &&
+                              BodyShare(entry[0]) >= StrongBodyShare &&
+                              entry[1].close <= priorBearLine &&
+                              entry[0].close > ctx.bearTrendLineNow);
+   ctx.channelOvershootReversalUp = (ctx.channelOvershootReversalUp ||
+                                     (ctx.trend < 0 && ctx.wedgeDown &&
+                                      ctx.failedBreakoutDown && BarDirection(entry[0]) > 0));
+   ctx.channelOvershootReversalDown = (ctx.channelOvershootReversalDown ||
+                                       (ctx.trend > 0 && ctx.wedgeUp &&
+                                        ctx.failedBreakoutUp && BarDirection(entry[0]) < 0));
+   ctx.duelingLines = (ctx.atrLike > 0.0 && hasBullSupportLine && hasBearResistanceLine &&
+                       MathAbs(ctx.bullTrendLineNow - ctx.bearTrendLineNow) <= ctx.atrLike * 0.50 &&
+                       MathAbs(entry[0].close - ctx.bullTrendLineNow) <= ctx.atrLike * 0.50 &&
+                       MathAbs(entry[0].close - ctx.bearTrendLineNow) <= ctx.atrLike * 0.50);
 }
 
 int CountReasonGroups(const SContext &ctx, const int direction)
@@ -488,16 +830,24 @@ int CountReasonGroups(const SContext &ctx, const int direction)
    bool trendAligned = (direction > 0 ? ctx.trend > 0 : ctx.trend < 0);
    bool rangeLocation = (direction > 0 ? ctx.nearRangeLow : ctx.nearRangeHigh);
    bool patternGroup = (direction > 0 ? (ctx.strongBreakoutUp || ctx.followThroughUp ||
-                                        ctx.failedBreakoutDown || ctx.high2 || ctx.wedgeDown || ctx.doubleBottom ||
-                                        ctx.headShouldersBottom || ctx.firstMAGapUp)
+                                        ctx.failedBreakoutDown || ctx.breakoutPullbackUp ||
+                                        ctx.high1 || ctx.high2 || ctx.high3 || ctx.high4 ||
+                                        ctx.wedgeDown || ctx.doubleBottom ||
+                                        ctx.headShouldersBottom || ctx.firstMAGapUp ||
+                                        ctx.tightRangeBullFade)
                                       : (ctx.strongBreakoutDown || ctx.followThroughDown ||
-                                        ctx.failedBreakoutUp || ctx.low2 || ctx.wedgeUp || ctx.doubleTop ||
-                                        ctx.headShouldersTop || ctx.firstMAGapDown));
+                                        ctx.failedBreakoutUp || ctx.breakoutPullbackDown ||
+                                        ctx.low1 || ctx.low2 || ctx.low3 || ctx.low4 ||
+                                        ctx.wedgeUp || ctx.doubleTop ||
+                                        ctx.headShouldersTop || ctx.firstMAGapDown ||
+                                        ctx.tightRangeBearFade));
    // A magnet is primarily a target; do not count it as a second reason by itself.
    bool contextGroup = (trendAligned || rangeLocation);
    bool independentTimeGroup = ctx.sessionOK && UseSessionFilter;
    bool volatilityGroup = (direction > 0 ? ctx.twentyGapUp : ctx.twentyGapDown) ||
-                          ctx.tightRange || ctx.triangle || ctx.duelingLines;
+                          ctx.triangle || ctx.duelingLines ||
+                          (direction > 0 ? (ctx.reversalLineBreakUp || ctx.channelOvershootReversalUp) :
+                                           (ctx.reversalLineBreakDown || ctx.channelOvershootReversalDown));
    if(patternGroup) groups++;
    if(contextGroup) groups++;
    if(independentTimeGroup) groups++;
@@ -508,7 +858,10 @@ int CountReasonGroups(const SContext &ctx, const int direction)
 bool IsBullishCandidate(const SContext &ctx)
 {
    bool candidate = (ctx.strongBreakoutUp || ctx.followThroughUp || ctx.failedBreakoutDown ||
-                     ctx.high2 || ctx.wedgeDown || ctx.doubleBottom || ctx.headShouldersBottom || ctx.firstMAGapUp);
+                     ctx.breakoutPullbackUp ||
+                     ctx.high1 || ctx.high2 || ctx.high3 || ctx.high4 || ctx.wedgeDown ||
+                     ctx.doubleBottom || ctx.headShouldersBottom || ctx.firstMAGapUp ||
+                     ctx.tightRangeBullFade);
    if(ctx.trend < 0 && !ctx.failedBreakoutDown && !ctx.wedgeDown && !ctx.doubleBottom && !ctx.headShouldersBottom)
       return false;
    return candidate;
@@ -517,7 +870,10 @@ bool IsBullishCandidate(const SContext &ctx)
 bool IsBearishCandidate(const SContext &ctx)
 {
    bool candidate = (ctx.strongBreakoutDown || ctx.followThroughDown || ctx.failedBreakoutUp ||
-                     ctx.low2 || ctx.wedgeUp || ctx.doubleTop || ctx.headShouldersTop || ctx.firstMAGapDown);
+                     ctx.breakoutPullbackDown ||
+                     ctx.low1 || ctx.low2 || ctx.low3 || ctx.low4 || ctx.wedgeUp ||
+                     ctx.doubleTop || ctx.headShouldersTop || ctx.firstMAGapDown ||
+                     ctx.tightRangeBearFade);
    if(ctx.trend > 0 && !ctx.failedBreakoutUp && !ctx.wedgeUp && !ctx.doubleTop && !ctx.headShouldersTop)
       return false;
    return candidate;
@@ -567,8 +923,27 @@ bool BuildSetup(const SContext &ctx, const MqlRates &rates[], SSetup &setup)
    if(bull == bear) return false;
    int direction = (bull ? 1 : -1);
    setup.direction = direction;
+   bool tightRangeAllowed = (direction > 0 ?
+                             (ctx.tightRangeFailedBreakoutDown || ctx.tightRangeBullFade) :
+                             (ctx.tightRangeFailedBreakoutUp || ctx.tightRangeBearFade));
+   if(ctx.tightRange && !AllowTightRangeSignals && !tightRangeAllowed)
+   {
+      setup.label = "SKIP tight range; wait for failed breakout or small edge fade";
+      return false;
+   }
+   bool countertrendReversalConfirmed = (direction > 0 ?
+      (ctx.reversalLineBreakUp || ctx.channelOvershootReversalUp) :
+      (ctx.reversalLineBreakDown || ctx.channelOvershootReversalDown));
+   if(ctx.steepTrend && direction != ctx.trend && !countertrendReversalConfirmed)
+   {
+      setup.label = "SKIP countertrend; steep trend needs line break or overshoot reversal";
+      return false;
+   }
    setup.reasonGroups = CountReasonGroups(ctx, direction);
-   setup.isRangeSetup = (ctx.range && (ctx.high2 || ctx.low2 || ctx.failedBreakoutUp || ctx.failedBreakoutDown));
+   setup.isRangeSetup = ((ctx.range || ctx.tightRange) &&
+                         (ctx.high2 || ctx.low2 || ctx.failedBreakoutUp ||
+                          ctx.failedBreakoutDown || ctx.tightRangeBullFade ||
+                          ctx.tightRangeBearFade));
    if(setup.reasonGroups < MinReasonGroups || !ctx.sessionOK) return false;
 
    double tick = TickSize();
@@ -613,9 +988,15 @@ bool BuildSetup(const SContext &ctx, const MqlRates &rates[], SSetup &setup)
    setup.stop = NormalizePrice(setup.stop);
    setup.target = NormalizePrice(setup.target);
    setup.expectedValue = EstimateExpectedValue(direction, setup.entry, setup.stop, setup.target);
-   if(setup.expectedValue <= 0.0) return false;
+   if(setup.expectedValue <= MinimumExpectedValuePoints)
+   {
+      setup.label = "SKIP expected value " + DoubleToString(setup.expectedValue, 1) +
+                    " points <= minimum " + DoubleToString(MinimumExpectedValuePoints, 1);
+      return false;
+   }
    setup.label = (direction > 0 ? "BUY" : "SELL");
-   if(ctx.failedBreakoutUp || ctx.failedBreakoutDown) setup.label += " failed-breakout";
+   if(ctx.breakoutPullbackUp || ctx.breakoutPullbackDown) setup.label += " breakout-test";
+   else if(ctx.failedBreakoutUp || ctx.failedBreakoutDown) setup.label += " failed-breakout";
    else if(ctx.high2 || ctx.low2) setup.label += " H2/L2";
    else if(ctx.wedgeUp || ctx.wedgeDown) setup.label += " three-push";
    else setup.label += " breakout/trend";
@@ -633,9 +1014,11 @@ double NormalizeVolumeDown(const double volume)
    return NormalizeDouble(MathMin(rounded, maxVol), 8);
 }
 
-double CalculateRiskVolume(const int direction, const double entry, const double stop)
+double CalculateRiskVolume(const int direction, const double entry, const double stop,
+                           const double riskMultiplier)
 {
-   double riskMoney = AccountInfoDouble(ACCOUNT_EQUITY) * RiskPercent / 100.0;
+   double riskMoney = AccountInfoDouble(ACCOUNT_EQUITY) * RiskPercent / 100.0 *
+                      riskMultiplier;
    if(riskMoney <= 0.0) return 0.0;
    double oneLotProfit = 0.0;
    ENUM_ORDER_TYPE type = (direction > 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
@@ -692,6 +1075,34 @@ bool ModifyManagedPosition(const ulong ticket, const double stop, const double t
    return true;
 }
 
+bool CloseManagedPositionPartial(const ulong ticket, const long type,
+                                 const double closeVolume)
+{
+   if(closeVolume <= 0.0 || !PositionSelectByTicket(ticket)) return false;
+   double currentVolume = PositionGetDouble(POSITION_VOLUME);
+   if(closeVolume >= currentVolume) return false;
+
+   ENUM_ACCOUNT_MARGIN_MODE marginMode =
+      (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
+   bool sent = false;
+   if(marginMode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
+      sent = trade.PositionClosePartial(ticket, closeVolume);
+   else if(type == POSITION_TYPE_BUY)
+      sent = trade.Sell(closeVolume, _Symbol, 0.0, 0.0, 0.0,
+                        "BootAI V2 scale out");
+   else
+      sent = trade.Buy(closeVolume, _Symbol, 0.0, 0.0, 0.0,
+                       "BootAI V2 scale out");
+
+   if(!sent || !TradeResultSucceeded())
+   {
+      Print("PARTIAL EXIT REJECTED: ticket=", ticket, " | ",
+            trade.ResultRetcode(), " | ", trade.ResultRetcodeDescription());
+      return false;
+   }
+   return true;
+}
+
 bool HasManagedPendingOrder()
 {
    for(int i = OrdersTotal() - 1; i >= 0; i--)
@@ -742,6 +1153,42 @@ bool CancelManagedPendingOrders()
    return allCleared;
 }
 
+bool CancelInvalidatedPendingOrders()
+{
+   bool allCleared = true;
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol ||
+         (ulong)OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+
+      ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      double invalidation = OrderGetDouble(ORDER_SL);
+      if(invalidation <= 0.0) continue;
+      bool invalidated = ((type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_BUY_LIMIT ||
+                           type == ORDER_TYPE_BUY_STOP_LIMIT) && bid <= invalidation) ||
+                         ((type == ORDER_TYPE_SELL_STOP || type == ORDER_TYPE_SELL_LIMIT ||
+                           type == ORDER_TYPE_SELL_STOP_LIMIT) && ask >= invalidation);
+      if(!invalidated) continue;
+
+      bool sent = trade.OrderDelete(ticket);
+      if(!sent || !TradeResultSucceeded())
+      {
+         allCleared = false;
+         Print("INVALIDATED PENDING ORDER CANCEL REJECTED: ticket=", ticket,
+               " | ", trade.ResultRetcode(), " | ", trade.ResultRetcodeDescription());
+      }
+      else
+         Print("PENDING ORDER CANCELLED: invalidation level was reached | ticket=", ticket);
+   }
+   return allCleared;
+}
+
+int ConfiguredMaxHoldingBars();
+
 bool PlaceSetupOrder(const SSetup &setup)
 {
    if(!EnableTradeExecution || HasManagedPosition() || HasManagedPendingOrder()) return false;
@@ -761,7 +1208,9 @@ bool PlaceSetupOrder(const SSetup &setup)
       return false;
    }
 
-   double volume = CalculateRiskVolume(setup.direction, setup.entry, setup.stop);
+   double riskMultiplier = (setup.useLimit ? LimitEntryRiskMultiplier : 1.0);
+   double volume = CalculateRiskVolume(setup.direction, setup.entry, setup.stop,
+                                       riskMultiplier);
    if(volume <= 0.0)
    {
       Print("ORDER SKIPPED: Calculated size is below the broker minimum or risk calculation failed.");
@@ -790,6 +1239,11 @@ bool PlaceSetupOrder(const SSetup &setup)
       Print("ORDER REJECTED: ", trade.ResultRetcode(), " | ", trade.ResultRetcodeDescription());
       return false;
    }
+   ulong orderTicket = trade.ResultOrder();
+   int lockedHorizon = ConfiguredMaxHoldingBars();
+   if(orderTicket > 0 && lockedHorizon > 0)
+      GlobalVariableSet("BAI2_ORDER_HORIZON_" + (string)orderTicket,
+                        (double)lockedHorizon);
    Print("PENDING ORDER: ", setup.label, " | volume=", DoubleToString(volume, 2),
          " | entry=", DoubleToString(setup.entry, _Digits),
          " | stop=", DoubleToString(setup.stop, _Digits),
@@ -799,21 +1253,74 @@ bool PlaceSetupOrder(const SSetup &setup)
    return true;
 }
 
+int ConfiguredMaxHoldingBars()
+{
+   if(TradeStyle == STYLE_SCALP) return MaxBarsForScalp;
+   if(TradeStyle == STYLE_INTRADAY_SWING) return MaxBarsForIntraday;
+   if(TradeStyle == STYLE_SWING) return MaxBarsForSwing;
+   return 0;
+}
+
+int LockedMaxHoldingBars(const ulong ticket)
+{
+   string styleKey = "BAI2_HORIZON_" + (string)ticket;
+   if(GlobalVariableCheck(styleKey))
+      return (int)GlobalVariableGet(styleKey);
+
+   int maxBars = ConfiguredMaxHoldingBars();
+   if(maxBars > 0) GlobalVariableSet(styleKey, (double)maxBars);
+   return maxBars;
+}
+
+bool FindRecentConfirmedSwing(const MqlRates &rates[], const bool findHigh,
+                              const int lookbackBars, double &swingPrice)
+{
+   swingPrice = 0.0;
+   int lastShift = MinInt(lookbackBars, ArraySize(rates) - 2);
+   if(lastShift < 2) return false;
+
+   // Rates are series: index 0 is newest. Shift 2 is the newest pivot that
+   // has at least one newer and one older closed bar confirming it.
+   for(int i = 2; i <= lastShift; i++)
+   {
+      if(findHigh)
+      {
+         if(rates[i].high >= rates[i-1].high && rates[i].high > rates[i+1].high)
+         {
+            swingPrice = rates[i].high;
+            return true;
+         }
+      }
+      else if(rates[i].low <= rates[i-1].low && rates[i].low < rates[i+1].low)
+      {
+         swingPrice = rates[i].low;
+         return true;
+      }
+   }
+   return false;
+}
+
 void ManageOpenPosition(const MqlRates &rates[])
 {
    ulong ticket = FindManagedPositionTicket();
    if(ticket == 0 || !PositionSelectByTicket(ticket)) return;
+   if(ticket != g_partialExitRetryTicket)
+   {
+      g_partialExitRetryTicket = ticket;
+      g_partialExitRetryAfter = 0;
+   }
    long type = PositionGetInteger(POSITION_TYPE);
    double open = PositionGetDouble(POSITION_PRICE_OPEN);
    double stop = PositionGetDouble(POSITION_SL);
    double target = PositionGetDouble(POSITION_TP);
    double volume = PositionGetDouble(POSITION_VOLUME);
    datetime opened = (datetime)PositionGetInteger(POSITION_TIME);
-   string partialKey = "BAI2_PART_" + (string)ticket;
+   string partialKey1 = "BAI2_PART1_" + (string)ticket;
+   string partialKey2 = "BAI2_PART2_" + (string)ticket;
    string riskKey = "BAI2_RISK_" + (string)ticket;
+   string initialVolumeKey = "BAI2_INITIAL_VOLUME_" + (string)ticket;
 
-   int maxBars = (TradeStyle == STYLE_SCALP ? 1 :
-                  TradeStyle == STYLE_INTRADAY_SWING ? 40 : 160);
+   int maxBars = LockedMaxHoldingBars(ticket);
    int heldBars = iBarShift(_Symbol, EntryTF, opened, false);
    if(heldBars >= maxBars && maxBars > 0)
    {
@@ -832,32 +1339,67 @@ void ManageOpenPosition(const MqlRates &rates[])
       if(initialRisk > 0.0) GlobalVariableSet(riskKey, initialRisk);
    }
    if(initialRisk <= 0.0) return;
+   double initialVolume = volume;
+   if(GlobalVariableCheck(initialVolumeKey))
+      initialVolume = GlobalVariableGet(initialVolumeKey);
+   else
+      GlobalVariableSet(initialVolumeKey, initialVolume);
+
    double mark = (type == POSITION_TYPE_BUY ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
                                              : SymbolInfoDouble(_Symbol, SYMBOL_ASK));
    double favorable = (type == POSITION_TYPE_BUY ? mark-open : open-mark);
-   if(EnablePartialExit && favorable >= initialRisk && !GlobalVariableCheck(partialKey))
+   if(EnablePartialExit && TimeCurrent() >= g_partialExitRetryAfter &&
+      favorable >= initialRisk * PartialExitAtR1 &&
+      !GlobalVariableCheck(partialKey1))
    {
-      double closeVolume = NormalizeVolumeDown(volume * 0.50);
-      bool partialSent = false;
-      if(closeVolume > 0.0 && closeVolume < volume)
+      double closeVolume = NormalizeVolumeDown(initialVolume * PartialExitPercent1 / 100.0);
+      if(closeVolume <= 0.0)
       {
-         ENUM_ACCOUNT_MARGIN_MODE marginMode = (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
-         if(marginMode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
-            partialSent = trade.PositionClosePartial(ticket, closeVolume);
-         else if(type == POSITION_TYPE_BUY)
-            partialSent = trade.Sell(closeVolume, _Symbol, 0.0, 0.0, 0.0, "BootAI V2 partial close");
-         else
-            partialSent = trade.Buy(closeVolume, _Symbol, 0.0, 0.0, 0.0, "BootAI V2 partial close");
+         GlobalVariableSet(partialKey1, 1.0);
+         Print("PARTIAL EXIT 1 SKIPPED: calculated volume is below broker minimum.");
       }
-      if(partialSent && TradeResultSucceeded())
+      else if(!PositionSelectByTicket(ticket) ||
+              closeVolume >= PositionGetDouble(POSITION_VOLUME))
       {
-         GlobalVariableSet(partialKey, 1.0);
-         Print("PARTIAL EXIT: closed half after approximately 1R.");
+         GlobalVariableSet(partialKey1, 1.0);
+         Print("PARTIAL EXIT 1 SKIPPED: tranche would close the full remaining position.");
       }
-      else if(partialSent)
+      else if(CloseManagedPositionPartial(ticket, type, closeVolume))
       {
-         Print("PARTIAL EXIT REJECTED: ", trade.ResultRetcode(), " | ", trade.ResultRetcodeDescription());
+         g_partialExitRetryAfter = 0;
+         GlobalVariableSet(partialKey1, 1.0);
+         Print("PARTIAL EXIT 1: closed ", DoubleToString(closeVolume, 2),
+               " lots at approximately ", DoubleToString(PartialExitAtR1, 2), "R.");
       }
+      else
+         g_partialExitRetryAfter = TimeCurrent() + 5;
+   }
+
+   if(EnablePartialExit && TimeCurrent() >= g_partialExitRetryAfter &&
+      favorable >= initialRisk * PartialExitAtR2 &&
+      !GlobalVariableCheck(partialKey2))
+   {
+      double closeVolume = NormalizeVolumeDown(initialVolume * PartialExitPercent2 / 100.0);
+      if(closeVolume <= 0.0)
+      {
+         GlobalVariableSet(partialKey2, 1.0);
+         Print("PARTIAL EXIT 2 SKIPPED: calculated volume is below broker minimum.");
+      }
+      else if(!PositionSelectByTicket(ticket) ||
+              closeVolume >= PositionGetDouble(POSITION_VOLUME))
+      {
+         GlobalVariableSet(partialKey2, 1.0);
+         Print("PARTIAL EXIT 2 SKIPPED: tranche would close the full remaining position.");
+      }
+      else if(CloseManagedPositionPartial(ticket, type, closeVolume))
+      {
+         g_partialExitRetryAfter = 0;
+         GlobalVariableSet(partialKey2, 1.0);
+         Print("PARTIAL EXIT 2: closed ", DoubleToString(closeVolume, 2),
+               " lots at approximately ", DoubleToString(PartialExitAtR2, 2), "R.");
+      }
+      else
+         g_partialExitRetryAfter = TimeCurrent() + 5;
    }
 
    if(MoveStopToBreakevenAtOneR && favorable >= initialRisk)
@@ -874,19 +1416,23 @@ void ManageOpenPosition(const MqlRates &rates[])
    double candidate = stop;
    if(type == POSITION_TYPE_BUY)
    {
-      double swingLow = rates[0].low;
-      for(int i = 1; i < MinInt(4, ArraySize(rates)); i++) swingLow = MinDouble(swingLow, rates[i].low);
-      candidate = NormalizePrice(swingLow - TickSize());
-      if(candidate > stop && candidate < mark)
-         ModifyManagedPosition(ticket, candidate, target);
+      double swingLow = 0.0;
+      if(FindRecentConfirmedSwing(rates, false, SwingTrailLookbackBars, swingLow))
+      {
+         candidate = NormalizePrice(swingLow - TickSize());
+         if(candidate > stop && candidate < mark)
+            ModifyManagedPosition(ticket, candidate, target);
+      }
    }
    else
    {
-      double swingHigh = rates[0].high;
-      for(int j = 1; j < MinInt(4, ArraySize(rates)); j++) swingHigh = MaxDouble(swingHigh, rates[j].high);
-      candidate = NormalizePrice(swingHigh + TickSize());
-      if((stop == 0.0 || candidate < stop) && candidate > mark)
-         ModifyManagedPosition(ticket, candidate, target);
+      double swingHigh = 0.0;
+      if(FindRecentConfirmedSwing(rates, true, SwingTrailLookbackBars, swingHigh))
+      {
+         candidate = NormalizePrice(swingHigh + TickSize());
+         if((stop == 0.0 || candidate < stop) && candidate > mark)
+            ModifyManagedPosition(ticket, candidate, target);
+      }
    }
 }
 
@@ -902,10 +1448,25 @@ void PrintContext(const SContext &ctx, const SSetup &setup, const bool hasSetup)
    Print("Evidence | breakout+", ctx.breakoutUp, "/-", ctx.breakoutDown,
          " | strong+", ctx.strongBreakoutUp, "/-", ctx.strongBreakoutDown,
          " | failed+", ctx.failedBreakoutUp, "/-", ctx.failedBreakoutDown,
-         " | H2/L2=", ctx.high2, "/", ctx.low2,
+         " | breakout-test+", ctx.breakoutPullbackUp, "/-", ctx.breakoutPullbackDown,
+         " (levels=", DoubleToString(ctx.breakoutTestLevelUp, _Digits), "/",
+         DoubleToString(ctx.breakoutTestLevelDown, _Digits), ")",
+         " | H-count=", ctx.highBarCount, " | L-count=", ctx.lowBarCount,
+         " | ABC bull/bear=", ctx.abcBullCorrection, "/", ctx.abcBearCorrection,
          " | wedge=", ctx.wedgeDown, "/", ctx.wedgeUp,
          " | DT/DB=", ctx.doubleTop, "/", ctx.doubleBottom,
          " | MA20-gap=", ctx.twentyGapUp, "/", ctx.twentyGapDown,
+         " | prior-failed-reversal-magnet=", ctx.priorFailureMagnet,
+         " (above=", DoubleToString(ctx.failedBullReversalTarget, _Digits),
+         ", below=", DoubleToString(ctx.failedBearReversalTarget, _Digits), ")",
+         " | dueling-lines=", ctx.duelingLines,
+         " (bull=", DoubleToString(ctx.bullTrendLineNow, _Digits),
+         ", bear=", DoubleToString(ctx.bearTrendLineNow, _Digits), ")",
+         " | steep-trend=", ctx.steepTrend,
+         " | trendline-break-up/down=", ctx.reversalLineBreakUp, "/", ctx.reversalLineBreakDown,
+         " | channel-overshoot-reversal-up/down=", ctx.channelOvershootReversalUp, "/",
+         ctx.channelOvershootReversalDown,
+         " | tight-range-fade-up/down=", ctx.tightRangeBullFade, "/", ctx.tightRangeBearFade,
          " | session=", ctx.sessionOK);
    if(hasSetup)
       Print("CANDIDATE | ", setup.label, " | evidence groups=", setup.reasonGroups,
@@ -915,7 +1476,12 @@ void PrintContext(const SContext &ctx, const SSetup &setup, const bool hasSetup)
             " | EV points=", DoubleToString(setup.expectedValue, 1),
             " | order=", (setup.useLimit ? "LIMIT" : "STOP"));
    else
-      Print("NO QUALIFIED SETUP | screening only; no order requested.");
+   {
+      if(StringFind(setup.label, "SKIP ") == 0)
+         Print("NO TRADE | ", setup.label);
+      else
+         Print("NO QUALIFIED SETUP | screening only; no order requested.");
+   }
 }
 
 int OnInit()
@@ -936,8 +1502,18 @@ int OnInit()
    }
    if(RiskPercent <= 0.0 || RiskPercent > 1.0 || EstimatedWinProbability < 0.0 ||
       EstimatedWinProbability > 1.0 || TargetRR <= 0.0 || MinReasonGroups < 1 ||
+      MinimumExpectedValuePoints < 0.0 ||
       MinReasonGroups > 4 || CommissionPerLotRoundTurn < 0.0 || SlippagePointsEstimate < 0 ||
       RangeOverlapThreshold < 0.0 || RangeOverlapThreshold > 1.0 ||
+      SteepTrendDisplacementATR < 0.5 || SteepTrendDisplacementATR > 5.0 ||
+      SmallBarRangeATR <= 0.0 || SmallBarRangeATR > 2.0 ||
+      MaxBarsForScalp < 1 || MaxBarsForIntraday < 1 || MaxBarsForSwing < 1 ||
+      LimitEntryRiskMultiplier <= 0.0 || LimitEntryRiskMultiplier > 1.0 ||
+      PartialExitAtR1 <= 0.0 || PartialExitAtR2 <= PartialExitAtR1 ||
+      PartialExitPercent1 <= 0.0 || PartialExitPercent1 >= 100.0 ||
+      PartialExitPercent2 <= 0.0 ||
+      PartialExitPercent1 + PartialExitPercent2 >= 100.0 ||
+      SwingTrailLookbackBars < 2 || SwingTrailLookbackBars > BarsToRead - 2 ||
       RangeEdgePercent <= 0.0 || RangeEdgePercent >= 50.0 ||
       StrongBodyShare < 0.0 || StrongBodyShare > 1.0 ||
       SessionStartHour < 0 || SessionStartHour > 23 || SessionEndHour < 0 || SessionEndHour > 23)
@@ -963,7 +1539,6 @@ int OnInit()
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFillingBySymbol(_Symbol);
    g_lastEntryBar = iTime(_Symbol, EntryTF, 0);
-   g_lastManageBar = g_lastEntryBar;
    Print("Boot AI V2 started. Execution=", (EnableTradeExecution ? "ON" : "OFF"),
          " | demo-only execution | scale-in=disabled.");
    return INIT_SUCCEEDED;
@@ -971,6 +1546,11 @@ int OnInit()
 
 void OnTick()
 {
+   if(!EnableTradeExecution)
+      CancelManagedPendingOrders();
+   else
+      CancelInvalidatedPendingOrders();
+
    if(HasManagedPosition() && HasManagedPendingOrder())
       CancelManagedPendingOrders();
 
@@ -983,11 +1563,7 @@ void OnTick()
 
    datetime currentBar = iTime(_Symbol, EntryTF, 0);
    if(currentBar == 0) return;
-   if(currentBar != g_lastManageBar)
-   {
-      ManageOpenPosition(entry);
-      g_lastManageBar = currentBar;
-   }
+   if(HasManagedPosition()) ManageOpenPosition(entry);
    if(currentBar == g_lastEntryBar) return;
    g_lastEntryBar = currentBar;
 
@@ -1009,6 +1585,26 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeResult &result)
 {
    if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
+   if(HistoryDealSelect(trans.deal) && trans.symbol == _Symbol &&
+      (ulong)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) == MagicNumber &&
+      (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY) == DEAL_ENTRY_IN)
+   {
+      ulong orderTicket = (ulong)HistoryDealGetInteger(trans.deal, DEAL_ORDER);
+      string orderHorizonKey = "BAI2_ORDER_HORIZON_" + (string)orderTicket;
+      if(GlobalVariableCheck(orderHorizonKey))
+      {
+         double lockedHorizon = GlobalVariableGet(orderHorizonKey);
+         for(int i = PositionsTotal() - 1; i >= 0; i--)
+         {
+            ulong positionTicket = PositionGetTicket(i);
+            if(positionTicket == 0) continue;
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+               (ulong)PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+               GlobalVariableSet("BAI2_HORIZON_" + (string)positionTicket,
+                                 lockedHorizon);
+         }
+      }
+   }
    if(HasManagedPosition()) CancelManagedPendingOrders();
 }
 
@@ -1016,4 +1612,3 @@ void OnDeinit(const int reason)
 {
    Print("Boot AI V2 stopped. Reason=", reason);
 }
-

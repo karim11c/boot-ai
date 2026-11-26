@@ -6,40 +6,37 @@ The work logs record a first-pass review of all 32 chapters. They explicitly say
 |---:|---|---|---|---|
 | 1 | 53–60 | Example breakout trade | Identify range escape, signal bar, stop distance, and measured-move candidate | Entry quality and stop placement depend on context |
 | 2 | 61–79 | Breakout strength | Body share, close location, and follow-through evidence | Correlated clues must not be counted as independent reasons |
-| 3 | 81–89 | Initial breakout | Confirm a close beyond the reference range and assess follow-through | A single bar is not proof of continuation |
+| 3 | 81–89 | Initial breakout | Confirm a close beyond the reference range and track a later retest with a directional signal bar | Range and signal thresholds are approximate; a single test does not prove continuation |
 | 4 | 91–97 | Breakouts in trends | Compare breakout direction with higher-timeframe trend | Late breakouts can be poor entries |
-| 5 | 99–117 | Failed breakouts and tests | Detect a close back inside after an attempted break; mark retests | Require a separate confirmation before reversal entry |
+| 5 | 99–117 | Failed breakouts and tests | Detect a prior close beyond the range, later boundary retest, no decisive close back through the level, and a current directional signal bar | Generic range breakout and three-tick/0.1-ATR retest tolerance; broader strength/context and labels still needed |
 | 6 | 119–151 | Gaps | Detect a true price gap between adjacent bars | Session gaps differ from ordinary FX noise |
 | 7 | 153–163 | Spike measured move | Project a second leg using the first leg's size | Projection is a target candidate, not a forecast |
 | 8 | 165–173 | Gap/range measured moves | Derive candidate targets from a gap or range height | Choose only after validating the anchor points |
-| 9 | 175–177 | Prior failed reversals | Track recent swing levels as coarse magnets and flag failed breakouts separately | Failed reversal levels are not yet persisted as a dedicated level set |
+| 9 | 175–177 | Prior failed reversals | Scan up to 100 closed bars for a countertrend signal bar, a one-tick stop-entry break, then a later breach of the protective extreme within three bars; keep the signal-bar extreme and approximate entry price as separate magnet candidates | Deterministic proxy only; same-bar order is ambiguous from OHLC data and ignored; local two-bar trend/signal classification needs labeled validation |
 | 10 | 179–181 | Other magnets | Track prior-day levels, range edges, and moving average | Broker session boundaries affect daily levels |
 | 11 | 205–212 | First pullback sequence | Track countertrend bars, overlap, and weakening follow-through | The sequence is contextual, not mandatory |
 | 12 | 213–231 | Double-top/bottom flags | Detect approximate paired swing tests and restrict against the higher-timeframe trend | The code does not yet reliably distinguish continuation flags from reversals |
 | 13 | 233–237 | Twenty-gap bars | Count closes extended from the moving average | The chapter's count is contextual, not a fixed trigger |
 | 14 | 239–243 | First MA-gap bars | Detect a bar fully separated from the moving average | Must distinguish trend from a range |
-| 15 | 245–251 | Key times of day | Optional server-time session filter | Session times must be configured for broker/server time |
+| 15 | 245–251 | Key times of day | Optional session window evaluated from the closed signal bar's broker-server timestamp, including windows crossing midnight | Generic time window only; source-specific inflection/trap setups and symbol-session calibration remain incomplete |
 | 16 | 253–257 | Leg counting | Count approximate swing legs and pullbacks | Bar counting is subjective; test against labeled examples |
-| 17 | 259–299 | High/Low 1-4 and ABC | Estimate attempts from alternating candle directions; log a separate rough pivot count | This is not Brooks bar counting or ABC identification; validate or replace with labeled examples |
+| 17 | 259–299 | High/Low 1-4 and ABC | Count bars whose high/low exceeds the prior bar during an estimated countertrend pullback; expose H1–H4 / L1–L4; flag a trend-aligned ABC H2/L2 when an opposing bar occurs between the first and second count | Finite-window proxy; tight-range count signals are gated by default; exact A/B/C legs, nested/fractal counts, and reliable resets remain approximate and require labeled examples |
 | 18 | 301–311 | Wedges / three pushes | Detect three progressively weaker pushes | Pivot definition and trend context need manual review |
-| 19 | 313–317 | Dueling lines | Use moving-average proximity plus swing/day/range magnets as a coarse confluence proxy | The code does not fit or compare two actual trend lines |
+| 19 | 313–317 | Dueling lines | Fit rising support through the two newest swing lows and falling resistance through the two newest swing highs within up to 100 bars; flag confluence when both projected lines and price are within 0.5 ATR | Straight-line pivot fit is a proxy; it misses prior-trend anchors, wedge/pullback context, line penetration behavior, and requires labeled validation |
 | 20 | 319–325 | Reversal patterns | Detect approximate double-top/bottom and head-and-shoulders shapes | Shape detection is approximate; pattern alone must not trigger an order |
 | 21 | 367–375 | Trading ranges | Prefer evidence near range edges; penalize the middle | Range boundaries are heuristic |
-| 22 | 377–410 | Tight ranges | Measure overlap, narrowness, and wick/body balance | Can be a pause or a continuation flag |
+| 22 | 377–410 | Tight ranges | Measure overlap/contraction; by default wait for a large breakout bar to exceed the boundary by at least three ticks and then fail, or fade a small directional reversal bar at a range edge | “Large,” “small,” range boundaries, and the failed-breakout sequence use engineering thresholds; require labeled chart checks; research override is available |
 | 23 | 411–415 | Triangles | Detect contracting swing highs/lows and breakout mode | Direction is unknown before a breakout and follow-through |
-| 24 | 419–515* | Trading style | Lock scalp/swing/day-trade holding profile before entry | V2 must not silently change the profile after entry |
-| 25 | 419–515* | Trading math | Calculate size from stop distance and estimate net expectancy | Probability is a configurable assumption until calibrated |
-| 26 | 419–515* | Two reasons | Require two evidence groups, not two correlated indicators | Independent evidence groups need review |
-| 27 | 419–515* | Stop entries | Place a pending stop beyond the signal bar when enabled | Fill, spread, and slippage need tester validation |
-| 28 | 419–515* | Limit entries | Optional range-edge limit orders, disabled by default | Countertrend limits need a separate test set |
-| 29 | 517–569* | Protective/trailing stops | Initial signal-bar stop and swing-based trailing candidate | Stop changes must never increase planned risk |
-| 30 | 517–569* | Profit targets | Fixed-R / measured-move candidate, attached SL/TP, partial exit, cancel remaining pendings on fill | OCO and partial-fill behavior need broker testing |
-| 31 | 517–569* | Scaling | Support scaling out; do not average into losing positions | Scaling in remains disabled pending dedicated testing |
-| 32 | 517–569* | Trapped traders | Use failed setups as context for an opposite-side candidate | Never infer manipulation from price alone |
-
-\* The work logs provide combined page ranges for Chapters 24–28 and 29–32 rather than a separate page span for each chapter.
+| 24 | 419–435 | Trading style | Select a configurable max-bar holding horizon for scalp, intraday, or swing at order placement, then transfer it to the managed position on fill | This only locks the exit horizon; style-specific setup and management rules remain unimplemented |
+| 25 | 437–479 | Trading math | Calculate size from stop distance and estimate net expectancy; reject estimates at or below configurable `MinimumExpectedValuePoints` (default 0.0) with the estimated EV and floor logged | Probability is a configurable assumption until calibrated; point-unit cost estimate and threshold require symbol-specific validation |
+| 26 | 481–490 | Two reasons | Require distinct evidence groups; block countertrend entries in a steep detected trend without a strong line-break or wedge/failure reversal proxy; apply the source-described tight-range wait/fade rule | Steepness, trendline fit, overshoot, and reason-group independence are approximate |
+| 27 | 491–492 | Stop entries | Place a pending stop beyond the signal bar when enabled; delete managed pending stop/limit entries if price reaches their attached protective invalidation level, and delete managed pendings when execution is disabled | Gap-throughs, broker retcodes, and behavior around order fills need tester validation |
+| 28 | 493–515 | Limit entries | Optional range-edge limit orders, disabled by default; when enabled, multiply size by configurable `LimitEntryRiskMultiplier` (default 0.50) | Size reduction reflects the source's warning that limit entries are aggressive and may be early; setup context and adverse-selection need a dedicated test set |
+| 29 | 517–534 | Protective/trailing stops | Initial signal-bar stop, optional breakeven move, and optional stop beyond the newest confirmed local swing pivot in a configurable closed-bar lookback | Trail only tightens the stop; broker minimum distances, gaps, rejected modifications, and pivot choice require tester validation |
+| 30 | 535–542 | Profit targets | Fixed-R / measured-move candidate, attached SL/TP, configurable staged partial exits, cancel remaining pendings on fill | OCO and partial-fill behavior need broker testing |
+| 31 | 543–566 | Scaling | Optional two-stage scale-out uses percentages of the initial volume at configurable R thresholds (defaults 50% at 1R and 25% at 2R), checked per tick with a retry cooldown; scale-in is rejected | Percentages and thresholds are test defaults, not book prescriptions; partial closes, minimum volume rounding, retries, and remaining-runner behavior need tester validation |
+| 32 | 567–570 | Trapped traders | Use failed setups as context for an opposite-side candidate; cancel an unfilled entry after its protective invalidation is breached | This is order hygiene, not a standalone validated trapped-trader signal; never infer manipulation from price alone |
 
 ## Current coverage status
 
 The V1 repository code covers only a small subset: a basic higher-timeframe high/low comparison and heuristic M15 range / failed-breakout / High 2 / Low 2 screening. It does not implement the complete chapter map, trade sizing, entries, exits, or risk management. V2 is a new working draft; no detector is validated until it has been checked against chart examples and tested in MetaTrader.
-
