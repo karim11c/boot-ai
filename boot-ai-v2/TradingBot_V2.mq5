@@ -73,6 +73,8 @@ struct SContext
    bool range;
    bool tightRange;
    bool triangle;
+   bool triangleFollowThroughUp;
+   bool triangleFollowThroughDown;
    bool bullMA;
    bool bearMA;
    bool firstMAGapUp;
@@ -379,13 +381,18 @@ bool IsTightRange(const MqlRates &rates[])
    return (prior > 0.0 && recent <= prior * 0.75 && overlap >= 5);
 }
 
-bool IsTriangle(const MqlRates &rates[], double &olderHigh, double &olderLow)
+bool IsTriangle(const MqlRates &rates[], const int start,
+                double &triangleHigh, double &triangleLow)
 {
-   if(ArraySize(rates) < 18) return false;
+   if(start < 0 || ArraySize(rates) < start + 16) return false;
    double recentHigh, recentLow;
-   GetRangeBounds(rates, 0, 8, recentHigh, recentLow);
-   GetRangeBounds(rates, 8, 8, olderHigh, olderLow);
-   return (recentHigh < olderHigh && recentLow > olderLow && recentHigh > recentLow);
+   double olderHigh, olderLow;
+   GetRangeBounds(rates, start, 8, recentHigh, recentLow);
+   GetRangeBounds(rates, start + 8, 8, olderHigh, olderLow);
+   triangleHigh = olderHigh;
+   triangleLow = olderLow;
+   return (recentHigh < olderHigh && recentLow > olderLow &&
+           triangleHigh > triangleLow);
 }
 
 int CountApproximateLegs(const MqlRates &rates[], const int bars)
@@ -691,7 +698,24 @@ void AnalyzeContext(const MqlRates &entry[], const MqlRates &trend[], SContext &
    ctx.range = (flips >= 4 && overlapRatio >= RangeOverlapThreshold);
    ctx.tightRange = IsTightRange(entry);
    double triangleHigh, triangleLow;
-   ctx.triangle = IsTriangle(entry, triangleHigh, triangleLow);
+   ctx.triangle = IsTriangle(entry, 0, triangleHigh, triangleLow);
+   double preBreakTriangleHigh, preBreakTriangleLow;
+   bool triangleBeforeBreak = IsTriangle(entry, 2,
+                                         preBreakTriangleHigh, preBreakTriangleLow);
+   bool triangleBreakUp = (triangleBeforeBreak &&
+                           entry[1].close > preBreakTriangleHigh &&
+                           BarDirection(entry[1]) > 0 &&
+                           BodyShare(entry[1]) >= StrongBodyShare);
+   bool triangleBreakDown = (triangleBeforeBreak &&
+                             entry[1].close < preBreakTriangleLow &&
+                             BarDirection(entry[1]) < 0 &&
+                             BodyShare(entry[1]) >= StrongBodyShare);
+   ctx.triangleFollowThroughUp = (triangleBreakUp &&
+                                  entry[0].close > entry[1].close &&
+                                  entry[0].close > preBreakTriangleHigh);
+   ctx.triangleFollowThroughDown = (triangleBreakDown &&
+                                    entry[0].close < entry[1].close &&
+                                    entry[0].close < preBreakTriangleLow);
    ctx.ma = AverageClose(entry, 0, MovingAveragePeriod);
    ctx.atrLike = AverageRange(entry, 0, 14);
    ctx.bullMA = (ctx.ma > 0.0 && entry[0].low > ctx.ma);
@@ -837,12 +861,14 @@ int CountReasonGroups(const SContext &ctx, const int direction)
    bool trendAligned = (direction > 0 ? ctx.trend > 0 : ctx.trend < 0);
    bool rangeLocation = (direction > 0 ? ctx.nearRangeLow : ctx.nearRangeHigh);
    bool patternGroup = (direction > 0 ? (ctx.strongBreakoutUp || ctx.followThroughUp ||
+                                        ctx.triangleFollowThroughUp ||
                                         ctx.failedBreakoutDown || ctx.breakoutPullbackUp ||
                                         ctx.high1 || ctx.high2 || ctx.high3 || ctx.high4 ||
                                         ctx.wedgeDown || ctx.doubleBottom ||
                                         ctx.headShouldersBottom || ctx.firstMAGapUp ||
                                         ctx.tightRangeBullFade)
                                       : (ctx.strongBreakoutDown || ctx.followThroughDown ||
+                                        ctx.triangleFollowThroughDown ||
                                         ctx.failedBreakoutUp || ctx.breakoutPullbackDown ||
                                         ctx.low1 || ctx.low2 || ctx.low3 || ctx.low4 ||
                                         ctx.wedgeUp || ctx.doubleTop ||
@@ -852,7 +878,7 @@ int CountReasonGroups(const SContext &ctx, const int direction)
    bool contextGroup = (trendAligned || rangeLocation);
    bool independentTimeGroup = ctx.sessionOK && UseSessionFilter;
    bool volatilityGroup = (direction > 0 ? ctx.twentyGapUp : ctx.twentyGapDown) ||
-                          ctx.triangle || ctx.duelingLines ||
+                          ctx.duelingLines ||
                           (direction > 0 ? (ctx.reversalLineBreakUp || ctx.channelOvershootReversalUp) :
                                            (ctx.reversalLineBreakDown || ctx.channelOvershootReversalDown));
    if(patternGroup) groups++;
@@ -864,7 +890,8 @@ int CountReasonGroups(const SContext &ctx, const int direction)
 
 bool IsBullishCandidate(const SContext &ctx)
 {
-   bool candidate = (ctx.strongBreakoutUp || ctx.followThroughUp || ctx.failedBreakoutDown ||
+   bool candidate = (ctx.strongBreakoutUp || ctx.followThroughUp ||
+                     ctx.triangleFollowThroughUp || ctx.failedBreakoutDown ||
                      ctx.breakoutPullbackUp ||
                      ctx.high1 || ctx.high2 || ctx.high3 || ctx.high4 || ctx.wedgeDown ||
                      ctx.doubleBottom || ctx.headShouldersBottom || ctx.firstMAGapUp ||
@@ -876,7 +903,8 @@ bool IsBullishCandidate(const SContext &ctx)
 
 bool IsBearishCandidate(const SContext &ctx)
 {
-   bool candidate = (ctx.strongBreakoutDown || ctx.followThroughDown || ctx.failedBreakoutUp ||
+   bool candidate = (ctx.strongBreakoutDown || ctx.followThroughDown ||
+                     ctx.triangleFollowThroughDown || ctx.failedBreakoutUp ||
                      ctx.breakoutPullbackDown ||
                      ctx.low1 || ctx.low2 || ctx.low3 || ctx.low4 || ctx.wedgeUp ||
                      ctx.doubleTop || ctx.headShouldersTop || ctx.firstMAGapDown ||
@@ -1008,7 +1036,8 @@ bool BuildSetup(const SContext &ctx, const MqlRates &rates[], SSetup &setup)
       return false;
    }
    setup.label = (direction > 0 ? "BUY" : "SELL");
-   if(ctx.breakoutPullbackUp || ctx.breakoutPullbackDown) setup.label += " breakout-test";
+   if(ctx.triangleFollowThroughUp || ctx.triangleFollowThroughDown) setup.label += " triangle-follow-through";
+   else if(ctx.breakoutPullbackUp || ctx.breakoutPullbackDown) setup.label += " breakout-test";
    else if(ctx.failedBreakoutUp || ctx.failedBreakoutDown) setup.label += " failed-breakout";
    else if(ctx.high2 || ctx.low2) setup.label += " H2/L2";
    else if(ctx.wedgeUp || ctx.wedgeDown) setup.label += " three-push";
@@ -1563,6 +1592,8 @@ void PrintContext(const SContext &ctx, const SSetup &setup, const bool hasSetup)
          " | range=", (ctx.range ? "yes" : "no"),
          " | tight=", (ctx.tightRange ? "yes" : "no"),
          " | triangle=", (ctx.triangle ? "yes" : "no"),
+         " | triangle-follow-through=", ctx.triangleFollowThroughUp, "/",
+         ctx.triangleFollowThroughDown,
          " | legs~", ctx.legCount, " | attempts~", ctx.attemptCount);
    Print("Evidence | breakout+", ctx.breakoutUp, "/-", ctx.breakoutDown,
          " | strong+", ctx.strongBreakoutUp, "/-", ctx.strongBreakoutDown,
