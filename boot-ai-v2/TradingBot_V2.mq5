@@ -45,10 +45,11 @@ input int SessionEndHour = 18;  // Broker-server hour; configure for the symbol/
 input bool EnableTradeExecution = false;
 input bool EnableLimitEntries = false;
 input bool EnablePartialExit = true;
-input double PartialExitAtR1 = 1.0;
+input double PartialExitAtR1 = 2.0;
 input double PartialExitPercent1 = 50.0;
-input double PartialExitAtR2 = 2.0;
+input double PartialExitAtR2 = 3.0;
 input double PartialExitPercent2 = 25.0;
+input bool TrailRunnerAfterSecondPartial = true;
 input bool MoveStopToBreakevenAtOneR = false;
 input bool EnableSwingTrailingStop = false;
 input int SwingTrailLookbackBars = 20;
@@ -145,6 +146,7 @@ struct SSetup
    int reasonGroups;
    bool isRangeSetup;
    bool useLimit;
+   bool usePartialExit;
    double entry;
    double stop;
    double target;
@@ -912,6 +914,7 @@ bool BuildSetup(const SContext &ctx, const MqlRates &rates[], SSetup &setup)
    setup.reasonGroups = 0;
    setup.isRangeSetup = false;
    setup.useLimit = false;
+   setup.usePartialExit = false;
    setup.entry = 0.0;
    setup.stop = 0.0;
    setup.target = 0.0;
@@ -944,6 +947,11 @@ bool BuildSetup(const SContext &ctx, const MqlRates &rates[], SSetup &setup)
                          (ctx.high2 || ctx.low2 || ctx.failedBreakoutUp ||
                           ctx.failedBreakoutDown || ctx.tightRangeBullFade ||
                           ctx.tightRangeBearFade));
+   bool strongDirectionalTrend = (ctx.trend == direction && !ctx.range &&
+      !ctx.tightRange && (ctx.steepTrend ||
+      (direction > 0 ? (ctx.strongBreakoutUp && ctx.followThroughUp)
+                     : (ctx.strongBreakoutDown && ctx.followThroughDown))));
+   setup.usePartialExit = (EnablePartialExit && strongDirectionalTrend);
    if(setup.reasonGroups < MinReasonGroups || !ctx.sessionOK) return false;
 
    double tick = TickSize();
@@ -1220,18 +1228,19 @@ bool PlaceSetupOrder(const SSetup &setup)
    trade.SetDeviationInPoints((ulong)SlippagePointsEstimate);
    trade.SetTypeFillingBySymbol(_Symbol);
    datetime expiry = TimeTradeServer() + PeriodSeconds(EntryTF) * 2;
+   double orderTarget = (setup.usePartialExit ? 0.0 : setup.target);
    bool sent = false;
    if(setup.direction > 0 && setup.useLimit)
-      sent = trade.BuyLimit(volume, setup.entry, _Symbol, setup.stop, setup.target,
+      sent = trade.BuyLimit(volume, setup.entry, _Symbol, setup.stop, orderTarget,
                             ORDER_TIME_SPECIFIED, expiry, "BootAI V2 range limit");
    else if(setup.direction < 0 && setup.useLimit)
-      sent = trade.SellLimit(volume, setup.entry, _Symbol, setup.stop, setup.target,
+      sent = trade.SellLimit(volume, setup.entry, _Symbol, setup.stop, orderTarget,
                              ORDER_TIME_SPECIFIED, expiry, "BootAI V2 range limit");
    else if(setup.direction > 0)
-      sent = trade.BuyStop(volume, setup.entry, _Symbol, setup.stop, setup.target,
+      sent = trade.BuyStop(volume, setup.entry, _Symbol, setup.stop, orderTarget,
                            ORDER_TIME_SPECIFIED, expiry, "BootAI V2 stop entry");
    else
-      sent = trade.SellStop(volume, setup.entry, _Symbol, setup.stop, setup.target,
+      sent = trade.SellStop(volume, setup.entry, _Symbol, setup.stop, orderTarget,
                             ORDER_TIME_SPECIFIED, expiry, "BootAI V2 stop entry");
 
    if(!sent || !TradeResultSucceeded())
@@ -1244,10 +1253,14 @@ bool PlaceSetupOrder(const SSetup &setup)
    if(orderTicket > 0 && lockedHorizon > 0)
       GlobalVariableSet("BAI2_ORDER_HORIZON_" + (string)orderTicket,
                         (double)lockedHorizon);
+   if(orderTicket > 0)
+      GlobalVariableSet("BAI2_ORDER_PARTIAL_" + (string)orderTicket,
+                        (setup.usePartialExit ? 1.0 : 0.0));
    Print("PENDING ORDER: ", setup.label, " | volume=", DoubleToString(volume, 2),
          " | entry=", DoubleToString(setup.entry, _Digits),
          " | stop=", DoubleToString(setup.stop, _Digits),
          " | target=", DoubleToString(setup.target, _Digits),
+         " | exit plan=", (setup.usePartialExit ? "staged trend exits" : "fixed candidate target"),
          " | evidence groups=", setup.reasonGroups,
          " | estimated EV points=", DoubleToString(setup.expectedValue, 1));
    return true;
@@ -1319,6 +1332,9 @@ void ManageOpenPosition(const MqlRates &rates[])
    string partialKey2 = "BAI2_PART2_" + (string)ticket;
    string riskKey = "BAI2_RISK_" + (string)ticket;
    string initialVolumeKey = "BAI2_INITIAL_VOLUME_" + (string)ticket;
+   string partialModeKey = "BAI2_PARTIAL_MODE_" + (string)ticket;
+   bool partialMode = (GlobalVariableCheck(partialModeKey) &&
+                       GlobalVariableGet(partialModeKey) > 0.5);
 
    int maxBars = LockedMaxHoldingBars(ticket);
    int heldBars = iBarShift(_Symbol, EntryTF, opened, false);
@@ -1348,7 +1364,7 @@ void ManageOpenPosition(const MqlRates &rates[])
    double mark = (type == POSITION_TYPE_BUY ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
                                              : SymbolInfoDouble(_Symbol, SYMBOL_ASK));
    double favorable = (type == POSITION_TYPE_BUY ? mark-open : open-mark);
-   if(EnablePartialExit && TimeCurrent() >= g_partialExitRetryAfter &&
+   if(partialMode && TimeCurrent() >= g_partialExitRetryAfter &&
       favorable >= initialRisk * PartialExitAtR1 &&
       !GlobalVariableCheck(partialKey1))
    {
@@ -1375,7 +1391,7 @@ void ManageOpenPosition(const MqlRates &rates[])
          g_partialExitRetryAfter = TimeCurrent() + 5;
    }
 
-   if(EnablePartialExit && TimeCurrent() >= g_partialExitRetryAfter &&
+   if(partialMode && TimeCurrent() >= g_partialExitRetryAfter &&
       favorable >= initialRisk * PartialExitAtR2 &&
       !GlobalVariableCheck(partialKey2))
    {
@@ -1412,7 +1428,10 @@ void ManageOpenPosition(const MqlRates &rates[])
       }
    }
 
-   if(!EnableSwingTrailingStop || ArraySize(rates) < 4) return;
+   bool runnerStageReached = GlobalVariableCheck(partialKey2);
+   bool trailRunner = (EnableSwingTrailingStop ||
+                       (TrailRunnerAfterSecondPartial && partialMode && runnerStageReached));
+   if(!trailRunner || ArraySize(rates) < 4) return;
    double candidate = stop;
    if(type == POSITION_TYPE_BUY)
    {
@@ -1591,6 +1610,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    {
       ulong orderTicket = (ulong)HistoryDealGetInteger(trans.deal, DEAL_ORDER);
       string orderHorizonKey = "BAI2_ORDER_HORIZON_" + (string)orderTicket;
+      string orderPartialKey = "BAI2_ORDER_PARTIAL_" + (string)orderTicket;
+      double partialMode = (GlobalVariableCheck(orderPartialKey) ?
+                            GlobalVariableGet(orderPartialKey) : 0.0);
       if(GlobalVariableCheck(orderHorizonKey))
       {
          double lockedHorizon = GlobalVariableGet(orderHorizonKey);
@@ -1600,10 +1622,26 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
             if(positionTicket == 0) continue;
             if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
                (ulong)PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+            {
                GlobalVariableSet("BAI2_HORIZON_" + (string)positionTicket,
                                  lockedHorizon);
+               GlobalVariableSet("BAI2_PARTIAL_MODE_" + (string)positionTicket,
+                                 partialMode);
+            }
          }
       }
+      else
+      {
+         for(int i = PositionsTotal() - 1; i >= 0; i--)
+         {
+            ulong positionTicket = PositionGetTicket(i);
+            if(positionTicket > 0 && PositionGetString(POSITION_SYMBOL) == _Symbol &&
+               (ulong)PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+               GlobalVariableSet("BAI2_PARTIAL_MODE_" + (string)positionTicket,
+                                 partialMode);
+         }
+      }
+      if(GlobalVariableCheck(orderPartialKey)) GlobalVariableDel(orderPartialKey);
    }
    if(HasManagedPosition()) CancelManagedPendingOrders();
 }

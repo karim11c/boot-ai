@@ -12,7 +12,7 @@ The V2 expert advisor is designed to:
 - Build market context and evaluate candidate price-action setups.
 - Keep a chapter-to-rule map and explain which evidence contributed to each signal.
 - Calculate a proposed stop, target, size, and expected value before an order is considered.
-- Optionally scale out in two risk-based stages while leaving a runner; scale-in remains blocked.
+- Optionally scale out only in a detected aligned strong trend: half near 2R, another quarter near 3R, then trail the remaining quarter; scale-in remains blocked.
 - Default to analysis-only mode. Order execution is behind explicit inputs and demo-account checks.
 - Cancel an unfilled managed pending entry if its attached invalidation level is reached, and cancel managed pending entries when execution is turned off.
 
